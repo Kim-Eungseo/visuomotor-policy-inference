@@ -44,10 +44,11 @@ docker run --rm -it --name "$NAME" \
   -e DISPLAY="${DISPLAY:-:0}" -e ROS_DOMAIN_ID=0 -e QT_X11_NO_MITSHM=1 -e VPI_STATE_DIR=/state \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v /dev/shm:/dev/shm:rw \
+  -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$TELEOP:/workspace" \
   -v "$REPO/.teleop_state:/state" \
   -v "$REPO/examples/teleop_gui.py:/tmp/teleop_gui.py:ro" \
   -v "$REPO/examples/hdr35_20.urdf:/tmp/hdr35_20.urdf:ro" \
   "$IMG" \
-  bash -lc "source /opt/ros/humble/setup.bash; pip install -q ikpy 2>/dev/null; \
+  bash -lc "source /opt/ros/humble/setup.bash; pip install -q ikpy pyarrow 2>/dev/null; \
             python3 -u /tmp/teleop_gui.py --side $SIDE $PASS"

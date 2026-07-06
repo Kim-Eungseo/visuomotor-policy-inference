@@ -125,3 +125,7 @@ system_Teleop/src/Manus_/ManusSDK/lib/libManusSDK_Integrated.so
 
 # oh-my-claudecode local state (not for VCS)
 .omc/
+
+
+retrieval_based_replay/
+.teleop_state/lerobot_dataset

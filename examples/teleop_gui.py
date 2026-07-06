@@ -18,6 +18,7 @@ import math
 import sys
 import json
 import os
+import shutil
 import threading
 import time
 
@@ -64,10 +65,23 @@ DG5F_GRIP_POSE = DG5F_OPEN_POSE.copy()
 for _i in DG5F_ACTIVE:
     DG5F_GRIP_POSE[_i] = _DG5F_GRIP_FULL[_i]
 
+# STAGED curl per finger: joint _1 fixed; then curl _4 (tip) -> _3 (middle) -> _2 (base) in order.
+# Each joint interpolates open->grip within its window of the grip fraction g in [0,1].
+DG5F_PHASE = {}
+for _f in range(2, 6):
+    DG5F_PHASE[(_f - 1) * 4 + 3] = (0.0, 1 / 3)      # _4 tip   (finishes first)
+    DG5F_PHASE[(_f - 1) * 4 + 2] = (1 / 3, 2 / 3)    # _3 middle
+    DG5F_PHASE[(_f - 1) * 4 + 1] = (2 / 3, 1.0)      # _2 base  (finishes last)
+
 
 def dg5f_staged_pose(g):
     g = float(np.clip(g, 0.0, 1.0))
-    return DG5F_OPEN_POSE + g * (DG5F_GRIP_POSE - DG5F_OPEN_POSE)   # only the 12 active joints move
+    out = DG5F_OPEN_POSE.copy()
+    for i in DG5F_ACTIVE:
+        s, e = DG5F_PHASE[i]
+        local = 0.0 if g <= s else (1.0 if g >= e else (g - s) / (e - s))
+        out[i] = DG5F_OPEN_POSE[i] + local * (DG5F_GRIP_POSE[i] - DG5F_OPEN_POSE[i])
+    return out
 
 QSS = """
 QWidget { background:#1e1e2e; color:#cdd6f4; font-family:'DejaVu Sans'; font-size:12px; }
@@ -347,15 +361,36 @@ class HandPub(Node):
         self.side = side
         self.actual = None            # latest actual hand joints (DG5F canonical order)
         self.front = None; self.wrist = None   # latest camera RGB frames (numpy HxWx3)
+        self.front_seq = 0                      # increments on each new Zivid frame (camera liveness)
+        self._js_sub = None
         if side == "right":
             self.pub = self.create_publisher(Float64MultiArray, "/inspire/right/target", 1)
         else:
             self.pub = self.create_publisher(MultiDOFCommand, "/dg5f_left/lj_dg_pospid/reference", 1)
-            self.create_subscription(JointState, "/dg5f_left/joint_states", self._js, 10)
+            self._resub_hand()
         # camera images from the vision node (front = Zivid, wrist = D405)
+        self._cam_subs = []
+        self._resub_cameras()
+
+    def _resub_hand(self):
+        """(Re)create the DG5F joint_states subscription — like the cameras, after the hand driver
+        restarts the old sub can stay stuck on the dead publisher's shared-memory segment."""
+        if self.side != "left":
+            return
+        try: self.destroy_subscription(self._js_sub)
+        except Exception: pass
+        self._js_sub = self.create_subscription(JointState, "/dg5f_left/joint_states", self._js, 10)
+
+    def _resub_cameras(self):
+        """(Re)create the camera subscriptions — after the vision node restarts, the old sub can
+        stay stuck on the dead publisher's shared-memory segments; re-subscribing re-matches it."""
+        for s in getattr(self, "_cam_subs", []):
+            try: self.destroy_subscription(s)
+            except Exception: pass
         img_qos = rclpy.qos.QoSProfile(depth=1, reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT)
-        self.create_subscription(Image, f"/system_{side}/zivid_rgb", self._front, img_qos)
-        self.create_subscription(Image, f"/system_{side}/d405_rgb", self._wrist, img_qos)
+        self._cam_subs = [
+            self.create_subscription(Image, f"/system_{self.side}/zivid_rgb", self._front, img_qos),
+            self.create_subscription(Image, f"/system_{self.side}/d405_rgb", self._wrist, img_qos)]
 
     @staticmethod
     def _decode(msg: Image):
@@ -367,7 +402,7 @@ class HandPub(Node):
             a = a[:, :, ::-1]
         return np.ascontiguousarray(a)
 
-    def _front(self, msg): self.front = self._decode(msg)
+    def _front(self, msg): self.front = self._decode(msg); self.front_seq += 1   # camera liveness
     def _wrist(self, msg): self.wrist = self._decode(msg)
 
     def _js(self, msg: JointState):
@@ -416,6 +451,7 @@ class ControlThread(threading.Thread):
         self.hand_manual = None             # grip-config dialog: publish this 20-joint pose directly
         self.last_hand_pose = None          # last DG5F pose published (= where the hand actually is)
         self.arm_resynced = False           # set after an auto-reconnect (Window re-syncs EEF)
+        self._arm_syncing = False           # hold the stream across a reconnect+resync (no stale jump)
         self._tick = 0
         self.max_dps = ARM_MAX_DPS          # per-joint speed cap (settable; sequence lowers it)
 
@@ -462,15 +498,23 @@ class ControlThread(threading.Thread):
     def _reconnect_arm(self):
         if self.arm is None or self.arm.reconnecting:
             return
-        if self.arm.reconnect():
-            try:
-                q = self.arm.wait_state(2.0)
+        # Hold the stream OFF across the WHOLE reconnect + resync. reconnect() clears its own
+        # `reconnecting` flag as soon as the socket is back, which would otherwise let run() stream the
+        # STALE arm_cmd (an absolute joint target) before we snap it to the fresh actual pose -> a jump.
+        self._arm_syncing = True
+        try:
+            if self.arm.reconnect():
+                self.arm.stop()                               # flush any trajectory points still queued
+                q = self.arm.wait_state(2.0)                  # _wire() reset q=None -> waits for FRESH state
                 with self.lock:
-                    self.arm_cmd = np.asarray(q[:6], float)   # re-sync so nothing jumps
+                    self.arm_cmd = np.asarray(q[:6], float)   # snap command+target to where the arm IS now
                     self.arm_tgt = self.arm_cmd.copy()
-                    self.arm_resynced = True                   # Window re-syncs its EEF target
-            except Exception:
-                pass
+                    self.max_dps = ARM_MAX_DPS                # drop any sequence speed-up
+                    self.arm_resynced = True                  # Window clears jog + re-syncs its EEF target
+        except Exception:
+            pass
+        finally:
+            self._arm_syncing = False
 
     def reconnect_arm(self):                # manual trigger (button)
         threading.Thread(target=self._reconnect_arm, daemon=True).start()
@@ -490,7 +534,8 @@ class ControlThread(threading.Thread):
                 if abs(gt - self.grip) <= gstep: self.grip = gt
                 else: self.grip += gstep if gt > self.grip else -gstep
                 grip = self.grip
-            if self.arm is not None and not es and not self.arm.reconnecting:  # E-STOP/reconnect: pause
+            if (self.arm is not None and not es and not self.arm.reconnecting
+                    and not self._arm_syncing):             # E-STOP / reconnect / resync: pause the stream
                 cmd = step_toward(self.arm_cmd, tgt, clamp)
                 try: self.arm.insert(cmd)
                 except Exception as e: print("[arm insert err]", e)
@@ -519,6 +564,87 @@ def jog_button(label, on_press, on_release):
     b.pressed.connect(on_press); b.released.connect(on_release)
     b.setFocusPolicy(QtCore.Qt.NoFocus)   # never steal keyboard focus from the main window
     return b
+
+
+class EpisodeRecorder:
+    """Record teleop episodes as a RAW folder straight from the GUI — real PNG images + a per-episode
+    parquet of state/action. A separate converter (convert_raw_to_lerobot.py, run in the inference
+    image that HAS lerobot) turns raw/ into a proper LeRobot v3.0 dataset via the real API. We do NOT
+    hand-write v3.0 here: its packed parquet + embedded PNG + meta/episodes pointers + stats aggregation
+    are too fragile to reproduce in this (lerobot-less) container and would silently fail to load.
+
+    state[26] = arm6(rad)+hand20(rad), action[26] = commanded arm6+hand20. Layout:
+        <root>/raw/episode_000000/front/000000.png  wrist/000000.png  ...  frames.parquet  meta.json
+    """
+    IMG_W, IMG_H = 640, 480              # both cams resized to the policy's 640x480
+
+    def __init__(self, root, fps=2, task="teleop"):
+        self.root, self.fps, self.task = root, fps, task
+        self.recording = False
+        self.raw = os.path.join(root, "raw")
+        os.makedirs(self.raw, exist_ok=True)
+        # next episode index = number of raw/episode_* dirs already present (append across launches)
+        self.ep_index = len([d for d in os.listdir(self.raw) if d.startswith("episode_")])
+
+    def start(self):
+        if self.recording:
+            return
+        self.buf = []; self.frame_i = 0
+        self.ep_dir = os.path.join(self.raw, f"episode_{self.ep_index:06d}")
+        os.makedirs(os.path.join(self.ep_dir, "front"), exist_ok=True)
+        os.makedirs(os.path.join(self.ep_dir, "wrist"), exist_ok=True)
+        self.recording = True
+
+    def add(self, state, action, front, wrist):
+        if not self.recording:
+            return
+        import cv2
+        i = self.frame_i
+        if front is not None:      # store as real PNG (RGB->BGR for cv2.imwrite), resized to 640x480
+            cv2.imwrite(os.path.join(self.ep_dir, "front", f"{i:06d}.png"),
+                        cv2.resize(front, (self.IMG_W, self.IMG_H))[:, :, ::-1])
+        if wrist is not None:
+            cv2.imwrite(os.path.join(self.ep_dir, "wrist", f"{i:06d}.png"),
+                        cv2.resize(wrist, (self.IMG_W, self.IMG_H))[:, :, ::-1])
+        self.buf.append({"frame_index": i, "timestamp": float(i / self.fps),   # contiguous (idle removed)
+                         "observation.state": [float(x) for x in state],
+                         "action": [float(x) for x in action], "task": self.task})
+        self.frame_i += 1
+
+    def stop(self):
+        if not self.recording:
+            return 0
+        self.recording = False
+        n = len(self.buf)
+        if n == 0:                                  # nothing kept — drop the empty episode dir
+            shutil.rmtree(self.ep_dir, ignore_errors=True)
+            return 0
+        import pandas as pd
+        pd.DataFrame(self.buf).to_parquet(os.path.join(self.ep_dir, "frames.parquet"), index=False)
+        json.dump({"fps": self.fps, "num_frames": n, "task": self.task, "image_hw": [self.IMG_H, self.IMG_W]},
+                  open(os.path.join(self.ep_dir, "meta.json"), "w"), indent=2)
+        self.ep_index += 1
+        return n
+
+
+def docker_restart(name, timeout=8):
+    """Restart another container via the Docker unix socket (mounted into this container).
+    Used by the Reconnect button to re-init the vision node's cameras. No docker CLI needed."""
+    import http.client
+    import socket as _sock
+
+    class _UConn(http.client.HTTPConnection):
+        def connect(self):
+            s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM); s.settimeout(timeout)
+            s.connect("/var/run/docker.sock"); self.sock = s
+    try:
+        c = _UConn("localhost"); c.request("POST", f"/containers/{name}/restart?t=5")
+        r = c.getresponse(); r.read(); c.close()
+        print(f"[reconnect] restart {name}: HTTP {r.status}", flush=True)
+        return r.status in (204, 200)
+    except Exception as e:
+        print(f"[reconnect] restart {name} failed: {e}", flush=True)
+        return False
 
 
 def np_to_qpixmap(rgb, w, h):
@@ -659,6 +785,14 @@ class TeleopWindow(QtWidgets.QMainWindow):
         self._build_ui(side)
         self._last = time.perf_counter()
         self.tick = QtCore.QTimer(self); self.tick.timeout.connect(self._loop); self.tick.start(16)  # ~60Hz
+        # LeRobot episode recorder (writes state[26]+action[26]+front/wrist video, per episode)
+        ds_root = os.environ.get("VPI_DATASET_DIR", "/state/lerobot_dataset")
+        # 2 Hz recording: action = the command being streamed at that instant, image = latest camera
+        # frame. Low rate (the robot smooths between waypoints itself), one frame per command sample.
+        rec_fps = int(os.environ.get("VPI_RECORD_FPS", "2"))
+        self.recorder = EpisodeRecorder(ds_root, fps=rec_fps)
+        self.rec_timer = QtCore.QTimer(self); self.rec_timer.timeout.connect(self._record_tick)
+        self.rec_timer.start(int(1000 / rec_fps))     # 2 Hz capture (500 ms)
 
     # ---- key map: key -> (kind, index, sign) ; kind 'L' linear / 'A' angular
     KEYS = {
@@ -681,10 +815,15 @@ class TeleopWindow(QtWidgets.QMainWindow):
         self.estop_btn.setStyleSheet("background:#f38ba8; color:#1e1e2e; font-weight:bold; font-size:16px;")
         self.estop_btn.clicked.connect(self._toggle_estop)
         topbar = QtWidgets.QHBoxLayout(); topbar.addWidget(self.estop_btn, 4)
-        self.reconn_btn = QtWidgets.QPushButton("Reconnect arm"); self.reconn_btn.setFocusPolicy(QtCore.Qt.NoFocus)
-        self.reconn_btn.setMinimumHeight(46); self.reconn_btn.clicked.connect(lambda: self.ctrl.reconnect_arm())
-        self.reconn_btn.setEnabled(self.has_arm); topbar.addWidget(self.reconn_btn, 1)
-        root.addLayout(topbar)
+        self.reconn_btn = QtWidgets.QPushButton("Reconnect"); self.reconn_btn.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.reconn_btn.setMinimumHeight(46); self.reconn_btn.clicked.connect(self._reconnect_all)
+        topbar.addWidget(self.reconn_btn, 1)
+        self.rec_btn = QtWidgets.QPushButton("● REC episode"); self.rec_btn.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.rec_btn.setMinimumHeight(46); self.rec_btn.clicked.connect(self._toggle_record)
+        self.rec_btn.setStyleSheet("background:#313244; color:#cdd6f4; font-weight:bold;")
+        topbar.addWidget(self.rec_btn, 1)
+        self.rec_lbl = QtWidgets.QLabel(""); self.rec_lbl.setObjectName("v")
+        root.addLayout(topbar); root.addWidget(self.rec_lbl)
         self.status = QtWidgets.QLabel(); self.status.setObjectName("stat"); root.addWidget(self.status)
 
         # EEF position
@@ -801,6 +940,81 @@ class TeleopWindow(QtWidgets.QMainWindow):
             self.cam_front.setPixmap(np_to_qpixmap(hp.front, self.cam_front.width(), self.cam_front.height()))
         if hp.wrist is not None:
             self.cam_wrist.setPixmap(np_to_qpixmap(hp.wrist, self.cam_wrist.width(), self.cam_wrist.height()))
+
+    def _reconnect_all(self):
+        # Reconnect the arm (OpenStream re-handshake), restart the vision node (re-init cameras),
+        # AND restart the hand driver (recovers a DG5F freeze: port open but joint_states stalled).
+        if self.has_arm:
+            self.ctrl.reconnect_arm()
+
+        def do_vision():
+            self.ctrl.hand_pub.front = self.ctrl.hand_pub.wrist = None    # show "waiting" until back
+            docker_restart(f"teleop_vision_{self.side}")
+            for _ in range(20):                       # wait for cameras to republish, then re-match
+                time.sleep(2)
+                self.ctrl.hand_pub._resub_cameras()
+                if self.ctrl.hand_pub.front is not None:
+                    break
+        threading.Thread(target=do_vision, daemon=True).start()
+
+        def do_hand():
+            hp = self.ctrl.hand_pub
+            hp.actual = None                          # show stale until joint_states resumes
+            docker_restart(f"teleop_hand_{self.side}")
+            for _ in range(15):                       # wait for joint_states, re-sub off the dead shm
+                time.sleep(2)
+                hp._resub_hand()
+                if hp.actual is not None or self.side != "left":
+                    break
+        if self.has_hand:
+            threading.Thread(target=do_hand, daemon=True).start()
+
+    _rec_last_action = None
+
+    def _toggle_record(self):
+        if not self.recorder.recording:
+            self._rec_last_action = None
+            self.recorder.start()
+            self.rec_btn.setText("■ STOP  (recording)")
+            self.rec_btn.setStyleSheet("background:#f38ba8; color:#1e1e2e; font-weight:bold;")
+        else:
+            n = self.recorder.stop()
+            self.rec_btn.setText("● REC episode")
+            self.rec_btn.setStyleSheet("background:#313244; color:#cdd6f4; font-weight:bold;")
+            self.rec_lbl.setText(f"saved episode {self.recorder.ep_index - 1} ({n} frames)  ->  {self.recorder.root}")
+
+    def _record_tick(self):
+        if not self.recorder.recording:
+            return
+        hp = self.ctrl.hand_pub
+        # 2 Hz (timer fires every 500 ms). Each tick = (state, action, latest camera image). We reuse
+        # the latest image (camera is ~7 Hz, faster than 2 Hz so it's always fresh) and sample the
+        # command being streamed as the action. Raw PNG + parquet -> convert to LeRobot later.
+        if hp is None or hp.front is None:
+            return
+        arm_q = self.ctrl.arm.q if (self.ctrl.arm is not None) else None
+        hand_a = hp.actual
+        hand_c = self.ctrl.last_hand_pose
+        if arm_q is None or hand_a is None or hand_c is None:
+            return                               # wait until all state is available
+        state = np.concatenate([np.radians(arm_q[:6]), np.asarray(hand_a, float)])
+        # action = the command being STREAMED to the robot right now (arm_cmd + last hand pose),
+        # sampled at 2 Hz. Consecutive rows form the low-rate waypoint trajectory (robot smooths between).
+        action = np.concatenate([np.radians(self.ctrl.arm_cmd[:6]), np.asarray(hand_c, float)])
+        # Keep a frame only while actively teleoping (input held OR the command moved since last frame);
+        # idle waits are skipped and kept frames are re-timestamped contiguously at the record fps.
+        active = (self.jog_lin.any() or self.jog_ang.any() or self._hand_jog != 0 or self.seq_running
+                  or abs(self.ctrl.grip - self.ctrl.grip_target) > 1e-4)
+        if not active and self._rec_last_action is not None:
+            active = np.max(np.abs(action - self._rec_last_action)) > 5e-4   # command moved (button/seq)
+        if not active:
+            self.rec_lbl.setText(f"● rec ep {self.recorder.ep_index}: {self.recorder.frame_i} frames"
+                                 f"  (paused — idle)")
+            return
+        self.recorder.add(state, action, hp.front, hp.wrist)
+        self._rec_last_action = action
+        self.rec_lbl.setText(f"● rec ep {self.recorder.ep_index}: {self.recorder.frame_i} frames "
+                             f"@ {self.recorder.fps}Hz  (raw PNG)")
 
     def _set_grip_ui(self, v):
         self.slider.setValue(v); self.ctrl.set_grip(v / 100.0)
