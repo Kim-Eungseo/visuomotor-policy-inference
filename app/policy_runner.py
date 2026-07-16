@@ -45,9 +45,15 @@ def decode_image(b64: str) -> np.ndarray:
 class PolicyRunner:
     """Thread-safe single-robot policy runner (one action queue)."""
 
-    def __init__(self, model_id: str | None = None, device: str | None = None):
+    def __init__(self, model_id: str | None = None, device: str | None = None,
+                 step_mode: bool | None = None):
         self.model_id = model_id or os.environ.get("VPI_MODEL_ID", "Ngseo/hyundai-uiwang-left-flowmatch")
         self.device = _resolve_device(device or os.environ.get("VPI_DEVICE", "cpu"))
+        # step_mode: re-infer on EVERY /predict (n_action_steps=1, RTC off) so the robot runs
+        # closed-loop step-by-step on fresh observations instead of replaying an 8-step chunk.
+        if step_mode is None:
+            step_mode = os.environ.get("VPI_STEP_MODE", "0").lower() in ("1", "true", "yes")
+        self.step_mode = bool(step_mode)
         self._lock = threading.Lock()
 
         # Make the deployed lerobot handle DINOv3 register tokens (no-op for resnet/dinov2).
@@ -56,6 +62,8 @@ class PolicyRunner:
 
         policy = DiffusionPolicy.from_pretrained(self.model_id)
         policy.config.device = self.device  # saved config pins cuda; align to runtime device
+        if self.step_mode:
+            policy.config.n_action_steps = 1  # queue one action -> re-infer with fresh obs each call
         policy.to(self.device).eval()
         policy.reset()
         self.policy = policy
@@ -73,6 +81,10 @@ class PolicyRunner:
             k: (int(policy.config.input_features[k].shape[1]), int(policy.config.input_features[k].shape[2]))
             for k in self.cameras
         }
+        # Front/wrist camera keys derived by name so both `observation.images.front_rgb`
+        # (flowmatch) and `observation.images.front` (some diffusion checkpoints) work.
+        self.front_key = next((k for k in self.cameras if "front" in k), FRONT_KEY)
+        self.wrist_key = next((k for k in self.cameras if "wrist" in k), WRIST_KEY)
 
         # Extra proprio inputs some checkpoints require (e.g. the *_full / DINOv3 models).
         feats = policy.config.input_features
@@ -80,6 +92,12 @@ class PolicyRunner:
         self.needs_ft = FT_KEY in feats
         self.gripper_dim = int(feats[GRIPPER_KEY].shape[0]) if self.needs_gripper else 0
         self.ft_dim = int(feats[FT_KEY].shape[0]) if self.needs_ft else 0
+        # Any OTHER proprio inputs the checkpoint declares (e.g. observation.eef, observation.grip).
+        _standard = {STATE_KEY, GRIPPER_KEY, FT_KEY}
+        self.extra_state_feats = {
+            k: int(feats[k].shape[0]) for k in feats
+            if "image" not in k and k not in _standard and k != ACTION_KEY
+        }
 
         self.smoother = self._build_smoother()
         self.rtc = self._build_rtc()
@@ -89,6 +107,8 @@ class PolicyRunner:
         background thread regenerates the next chunk (no inference on the request path).
         VPI_RTC=0 disables it (falls back to synchronous select_action). VPI_RTC_HORIZON
         overrides the execution horizon."""
+        if self.step_mode:
+            return None  # step mode wants a fresh single-step inference per call, not RTC chunking
         if os.environ.get("VPI_RTC", "1").lower() in ("0", "false", "no", ""):
             return None
         if str(getattr(self.policy.config, "noise_scheduler_type", "")).lower() != "flowmatch":
@@ -169,14 +189,14 @@ class PolicyRunner:
 
     @torch.no_grad()
     def predict(self, front_rgb: np.ndarray, wrist_rgb: np.ndarray, state: np.ndarray,
-                gripper_sensor=None, wrist_ft_sensor=None) -> np.ndarray:
+                gripper_sensor=None, wrist_ft_sensor=None, extra_inputs=None) -> np.ndarray:
         if state.shape[-1] != self.state_dim:
             raise ValueError(f"state must have {self.state_dim} dims, got {state.shape[-1]}")
-        front_rgb = self._fit(front_rgb, self.image_hw.get(FRONT_KEY, front_rgb.shape[:2]))
-        wrist_rgb = self._fit(wrist_rgb, self.image_hw.get(WRIST_KEY, wrist_rgb.shape[:2]))
+        front_rgb = self._fit(front_rgb, self.image_hw.get(self.front_key, front_rgb.shape[:2]))
+        wrist_rgb = self._fit(wrist_rgb, self.image_hw.get(self.wrist_key, wrist_rgb.shape[:2]))
         obs = {
-            FRONT_KEY: torch.from_numpy(front_rgb).float().div(255).permute(2, 0, 1).unsqueeze(0).to(self.device),
-            WRIST_KEY: torch.from_numpy(wrist_rgb).float().div(255).permute(2, 0, 1).unsqueeze(0).to(self.device),
+            self.front_key: torch.from_numpy(front_rgb).float().div(255).permute(2, 0, 1).unsqueeze(0).to(self.device),
+            self.wrist_key: torch.from_numpy(wrist_rgb).float().div(255).permute(2, 0, 1).unsqueeze(0).to(self.device),
             STATE_KEY: torch.from_numpy(state.astype(np.float32)).unsqueeze(0).to(self.device),
             "task": "",
             "robot_type": "",
@@ -189,6 +209,14 @@ class PolicyRunner:
             obs[GRIPPER_KEY] = self._vec(gripper_sensor, self.gripper_dim, "gripper_sensor")
         if self.needs_ft and wrist_ft_sensor is not None:
             obs[FT_KEY] = self._vec(wrist_ft_sensor, self.ft_dim, "wrist_ft_sensor")
+        # Other required proprio inputs (e.g. observation.eef, observation.grip): use the
+        # caller-provided value if present, else zeros (keeps the model runnable; the client
+        # should send real values for in-distribution behavior).
+        extra_inputs = extra_inputs or {}
+        for k, dim in self.extra_state_feats.items():
+            v = extra_inputs.get(k) if k in extra_inputs else extra_inputs.get(k.split(".")[-1])
+            obs[k] = (self._vec(v, dim, k) if v is not None
+                      else torch.zeros(1, dim, dtype=torch.float32, device=self.device))
         if self.rtc is not None:
             # RTC: serve instantly from the action queue; inference overlaps execution in a bg thread
             act = self.rtc.step(self.preprocess(obs))
@@ -215,4 +243,5 @@ class PolicyRunner:
             "num_inference_steps": getattr(self.policy.config, "num_inference_steps", None),
             "ruckig": getattr(self, "_ruckig_cfg", None) if self.smoother is not None else None,
             "rtc": getattr(self, "_rtc_cfg", None) if self.rtc is not None else None,
+            "step_mode": self.step_mode,
         }

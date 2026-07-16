@@ -36,6 +36,9 @@ class KNNPolicyRunner:
         self.temp = float(temp or os.environ.get("VPI_KNN_TEMP", "0.05"))
         self.N = max(1, int(os.environ.get("VPI_KNN_CHUNK", "8")))       # chunk length (1 = single-step)
         self.ens_m = float(os.environ.get("VPI_KNN_ENS_M", "0.1"))       # temporal-ensemble recency decay
+        # which camera(s) to encode into the query embedding — must match how the bank was built.
+        # e.g. VPI_KNN_CAMS=wrist  -> wrist-only 768-d ; default front,wrist -> concatenated 1536-d.
+        self.cams = [c.strip() for c in os.environ.get("VPI_KNN_CAMS", "front,wrist").split(",") if c.strip()]
 
         bank_path = bank_path or os.environ.get("VPI_KNN_BANK", "knn_bank_left_vits16.npz")
         z = np.load(bank_path)
@@ -77,9 +80,10 @@ class KNNPolicyRunner:
 
     @torch.no_grad()
     def predict(self, front_rgb: np.ndarray, wrist_rgb: np.ndarray,
-                state=None, gripper_sensor=None, wrist_ft_sensor=None) -> np.ndarray:
+                state=None, gripper_sensor=None, wrist_ft_sensor=None, extra_inputs=None) -> np.ndarray:
         # image-only: state/gripper/ft accepted (server drop-in) but ignored.
-        q = F.normalize(torch.cat([self._embed(front_rgb), self._embed(wrist_rgb)], dim=-1), dim=-1)
+        imgs = {"front": front_rgb, "wrist": wrist_rgb}
+        q = F.normalize(torch.cat([self._embed(imgs[c]) for c in self.cams], dim=-1), dim=-1)
         vals, idx = torch.topk(q @ self.bank.T, self.k, dim=1)      # (1,k)
         w = torch.softmax(vals / self.temp, dim=1)                  # (1,k)
         chunk = (w[0][:, None, None] * self.bank_fut[idx[0]]).sum(0).float().cpu().numpy()  # (N,26)
@@ -99,7 +103,7 @@ class KNNPolicyRunner:
         return {
             "model_id": f"knn-vinn:{self.dino.split('/')[-1]}",
             "device": self.device,
-            "cameras": ["observation.images.front_rgb", "observation.images.wrist_rgb"],
+            "cameras": [f"observation.images.{c}_rgb" for c in self.cams],
             "state_dim": 0,
             "action_dim": self.action_dim,
             "scheduler": "knn-vinn",

@@ -39,9 +39,12 @@ fi
 docker rm -f "$NAME" teleop_gui >/dev/null 2>&1 || true
 
 echo "[teleop_gui] side=$SIDE  ${PASS}"
-docker run --rm -it --name "$NAME" \
+TTYFLAG=""; [ -t 0 ] && TTYFLAG="-it"   # interactive TTY only when run from a terminal (not headless)
+docker run --rm $TTYFLAG --name "$NAME" \
   --network host \
   -e DISPLAY="${DISPLAY:-:0}" -e ROS_DOMAIN_ID=0 -e QT_X11_NO_MITSHM=1 -e VPI_STATE_DIR=/state \
+  -e VPI_HOST_REPO="$REPO" -e VPI_HOST_STATE="$REPO/.teleop_state" \
+  -e VPI_INFER_URL="http://localhost:8000" -e VPI_SEG_URL="http://localhost:8100" \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v /dev/shm:/dev/shm:rw \
   -v /var/run/docker.sock:/var/run/docker.sock \
@@ -49,6 +52,7 @@ docker run --rm -it --name "$NAME" \
   -v "$REPO/.teleop_state:/state" \
   -v "$REPO/examples/teleop_gui.py:/tmp/teleop_gui.py:ro" \
   -v "$REPO/examples/hdr35_20.urdf:/tmp/hdr35_20.urdf:ro" \
+  -v "${VPI_HF_CACHE:-$HOME/.cache/huggingface}:/hf:ro" \
   "$IMG" \
   bash -lc "source /opt/ros/humble/setup.bash; pip install -q ikpy pyarrow 2>/dev/null; \
             python3 -u /tmp/teleop_gui.py --side $SIDE $PASS"

@@ -19,6 +19,8 @@ from app.policy_runner import PolicyRunner, decode_image
 from app.schemas import (
     HealthResponse,
     InfoResponse,
+    LoadRequest,
+    LoadResponse,
     PredictRequest,
     PredictResponse,
     ResetResponse,
@@ -71,6 +73,26 @@ def reset() -> ResetResponse:
     return ResetResponse(status="reset")
 
 
+@app.post("/load", response_model=LoadResponse)
+def load(req: LoadRequest) -> LoadResponse:
+    """Swap the served policy at runtime (GUI model picker). diffusion loads `model_id`;
+    knn re-inits from the VPI_KNN_* env."""
+    try:
+        if req.policy.lower() == "knn":
+            from app.knn_runner import KNNPolicyRunner
+            logger.info("Loading kNN (VINN) policy ...")
+            STATE["runner"] = KNNPolicyRunner()
+        else:
+            logger.info("Loading diffusion policy from %s (step_mode=%s) ...", req.model_id, req.step_mode)
+            STATE["runner"] = PolicyRunner(model_id=req.model_id, step_mode=req.step_mode)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("model load failed")
+        raise HTTPException(status_code=500, detail=f"load failed: {e}") from e
+    info = STATE["runner"].info()
+    logger.info("Policy switched: %s", info)
+    return LoadResponse(status="loaded", info=info)
+
+
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest) -> PredictResponse:
     runner = get_runner()
@@ -78,8 +100,14 @@ def predict(req: PredictRequest) -> PredictResponse:
         front = decode_image(req.front_rgb)
         wrist = decode_image(req.wrist_rgb)
         state = np.asarray(req.state, dtype=np.float32)
+        extra_inputs = {}
+        if req.eef is not None:
+            extra_inputs["observation.eef"] = req.eef
+        if req.grip is not None:
+            extra_inputs["observation.grip"] = req.grip
         action = runner.predict(front, wrist, state,
-                                gripper_sensor=req.gripper_sensor, wrist_ft_sensor=req.wrist_ft_sensor)
+                                gripper_sensor=req.gripper_sensor, wrist_ft_sensor=req.wrist_ft_sensor,
+                                extra_inputs=extra_inputs)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001

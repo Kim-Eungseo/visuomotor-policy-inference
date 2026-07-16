@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Mindlessly fix a stuck hand. Does EVERYTHING it can in software, then verifies motion.
 #   ./fix_hand.sh right    # Inspire (serial)
-#   ./fix_hand.sh left     # DG5F   (Modbus TCP @ 192.168.4.73:502)
+#   ./fix_hand.sh left     # DG5F   (Modbus TCP @ 192.168.4.73 or 169.254.186.73 : 502)
 #
-# LEFT (DG5F): fixes the host IP conflict (.73), waits for the gripper's Modbus port, restarts the
+# LEFT (DG5F): fixes the host IP conflict, waits for the gripper's Modbus port, restarts the
 # driver, waits for the controllers + joint_states, retries, then does a grip->open motion test.
 # If the DG5F's Modbus (502) never comes up, that's a HARDWARE freeze — power-cycle the hand.
 # RIGHT (Inspire): restarts the serial driver (auto-detects the FTDI port) and verifies motion.
@@ -36,24 +36,19 @@ fi
 
 echo "[fix_hand] side=$SIDE"
 
-# ---- LEFT preflight: host IP conflict + Modbus reachability ----
+# ---- LEFT preflight: resolve the hand IP (.4.73 or .186.73) + wait for Modbus ----
 if [ "$SIDE" = left ]; then
-  # the host must NOT hold 192.168.4.73 (that's the DG5F). Move host to .55 if it stole it.
-  if ip -br addr show enp4s0 2>/dev/null | grep -q '192.168.4.73'; then
-    echo "[fix_hand] host is holding .73 (DG5F's IP) -> moving host to .55"
-    sudo ip addr del 192.168.4.73/24 dev enp4s0 2>/dev/null
-    sudo ip addr add 192.168.4.55/24 dev enp4s0 2>/dev/null || true
-  fi
-  # wait for the DG5F Modbus server (502) to be reachable
-  echo -n "[fix_hand] waiting for DG5F Modbus 192.168.4.73:502 "
+  # shellcheck source=dg5f_ip.sh
+  source "$(dirname "$0")/dg5f_ip.sh"
+  echo -n "[fix_hand] locating DG5F Modbus (tries .4.73 / .186.73 : $DG5F_PORT) "
   up=0
   for i in $(seq 1 20); do
-    if timeout 2 bash -c "echo > /dev/tcp/192.168.4.73/502" 2>/dev/null; then up=1; echo " OPEN"; break; fi
+    if resolve_dg5f_ip; then up=1; echo " OPEN @ $DG5F_IP:$DG5F_PORT"; break; fi
     echo -n "."; sleep 2
   done
   if [ "$up" -eq 0 ]; then
     echo " STILL CLOSED"
-    echo "[fix_hand] ❌ DG5F Modbus (502) is down = HARDWARE freeze."
+    echo "[fix_hand] ❌ DG5F Modbus (502) is down on all known IPs = HARDWARE freeze."
     echo "           Power-cycle the DG5F hand (off, wait ~5s, on), then re-run: ./fix_hand.sh left"
     echo "           (verify with: ./dg5f_probe.py)"
     exit 1

@@ -18,7 +18,10 @@ DINO = os.environ.get("VPI_KNN_DINO", "facebook/dinov3-vitb16-pretrain-lvd1689m"
 REPO = os.environ.get("VPI_KNN_REPO", "local/hyundai_uiwang_left")
 ROOT = os.environ.get("VPI_KNN_ROOT", "/home/ngseo/remove_hook/lerobot/data/lerobot/hyundai_uiwang_left")
 OUT = os.environ.get("VPI_KNN_OUT", "/home/ngseo/visuomotor-policy-inference/knn_bank_left.npz")
-FKEY, WKEY = "observation.images.front_rgb", "observation.images.wrist_rgb"
+FKEY = os.environ.get("VPI_KNN_FKEY", "observation.images.front_rgb")   # our dataset: observation.images.front
+WKEY = os.environ.get("VPI_KNN_WKEY", "observation.images.wrist_rgb")   #              observation.images.wrist
+CAMS = [c.strip() for c in os.environ.get("VPI_KNN_CAMS", "front,wrist").split(",") if c.strip()]
+CAM_KEY = {"front": FKEY, "wrist": WKEY}
 
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 model = AutoModel.from_pretrained(DINO).to(dev).eval()
@@ -40,13 +43,12 @@ def main():
     ds = LeRobotDataset(REPO, root=ROOT)
     N = len(ds)
     print(f"dataset {REPO}: {N} frames | encoder {DINO} on {dev}")
-    dl = DataLoader(ds, batch_size=128, num_workers=8, shuffle=False, pin_memory=True)
+    dl = DataLoader(ds, batch_size=128, num_workers=int(os.environ.get("VPI_KNN_WORKERS","2")), shuffle=False, pin_memory=True)
 
     embs, acts, epis = [], [], []
     done = 0
     for b in dl:
-        ef, ew = encode(b[FKEY]), encode(b[WKEY])
-        e = F.normalize(torch.cat([ef, ew], dim=-1), dim=-1)     # (B, 1536)
+        e = F.normalize(torch.cat([encode(b[CAM_KEY[c]]) for c in CAMS], dim=-1), dim=-1)  # (B, 768*len(CAMS))
         embs.append(e.cpu().numpy())
         acts.append(np.asarray(b["action"], dtype=np.float32))
         epis.append(np.asarray(b["episode_index"]).reshape(-1))

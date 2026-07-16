@@ -134,6 +134,10 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
+    # When False, `observation.state` is excluded from the global conditioning (image-only
+    # policy) even if it is present in `input_features`. Checkpoints trained this way have a
+    # correspondingly smaller Unet conditioning dim, so this must match the training run.
+    use_robot_state: bool = True
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5

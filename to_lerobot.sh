@@ -20,12 +20,8 @@ IMG="visuomotor-policy-inference:latest"
 NEPS=$(find "$RAW" -maxdepth 2 -name frames.parquet 2>/dev/null | wc -l)
 [ "$NEPS" -gt 0 ] || { echo "[to_lerobot] no finished episodes under $RAW"; exit 1; }
 
-# The output dataset is a derived artifact (regenerable from raw/). lerobot's create() wants to make
-# the root dir itself, so we delete any existing OUT and mount its PARENT (create() makes the leaf).
-if [ -d "$OUT" ]; then
-  echo "[to_lerobot] removing existing output (regenerable): $OUT"
-  rm -rf "$OUT"
-fi
+# INCREMENTAL: the converter appends only NEW raw episodes to $OUT (tracked via a manifest). For a
+# full rebuild from scratch, delete $OUT first:  sudo rm -rf "$OUT"
 OUTP="$(dirname "$OUT")"; OUTB="$(basename "$OUT")"
 mkdir -p "$OUTP"
 
@@ -33,8 +29,8 @@ echo "[to_lerobot] $NEPS episode(s)"
 echo "[to_lerobot] raw = $RAW"
 echo "[to_lerobot] out = $OUT   repo_id=$REPO_ID"
 
-docker run --rm \
-  -e HF_HUB_OFFLINE=1 -e HF_DATASETS_OFFLINE=1 \
+docker run --rm --network host \
+  -e HF_HUB_OFFLINE=1 -e HF_DATASETS_OFFLINE=1 -e VPI_SEG_URL="${VPI_SEG_URL:-http://localhost:8100}" \
   -v "$RAW:/raw:ro" \
   -v "$OUTP:/outp" \
   -v "$REPO/examples/convert_raw_to_lerobot.py:/convert.py:ro" \

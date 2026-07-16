@@ -129,3 +129,7 @@ system_Teleop/src/Manus_/ManusSDK/lib/libManusSDK_Integrated.so
 
 retrieval_based_replay/
 .teleop_state/lerobot_dataset
+# Runtime data / recordings / weights (too large for git)
+.teleop_state/
+models/
+*.npz

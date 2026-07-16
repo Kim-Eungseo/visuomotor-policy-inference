@@ -5,7 +5,7 @@
 #
 # Prereq: that side's hand driver up (./up.sh <side>).
 #   right (Inspire): if it doesn't move it's a serial freeze -> ./fix_hand.sh right
-#   left  (DG5F):    needs the hand powered + Modbus reachable (192.168.4.73:502). If the
+#   left  (DG5F):    needs the hand powered + Modbus reachable (192.168.4.73 or 169.254.186.73 :502). If the
 #                    ros2_control controller isn't active this script says so instead of
 #                    silently doing nothing.
 set -uo pipefail
@@ -47,7 +47,13 @@ subs=$(docker exec "$CONTAINER" bash -lc "source /opt/ros/humble/setup.bash; exp
 if [ "${subs:-0}" = "0" ]; then
   echo "ERROR: no subscriber on $TOPIC — the hand controller/driver is not active."
   if [ "$SIDE" = left ]; then
-    echo "       DG5F not ready. Check: hand powered + 'nc -z 192.168.4.73 502', then:"
+    # resolve which hand IP is actually live (.4.73 or .186.73) and report it
+    source "$(dirname "$0")/dg5f_ip.sh"
+    if resolve_dg5f_ip; then
+      echo "       DG5F Modbus IS up at $DG5F_IP:$DG5F_PORT but no controller — driver not spawned."
+    else
+      echo "       DG5F not reachable on any known IP (tried .4.73 / .186.73). Check hand power + ethernet."
+    fi
     echo "       docker restart teleop_hand_left   (controller spawns once Modbus connects)"
   else
     echo "       ./fix_hand.sh right"
