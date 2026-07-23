@@ -2101,7 +2101,16 @@ class TeleopWindow(QtWidgets.QMainWindow):
             # ACTION CHUNK: the server is loaded step_mode=False, so the model queues an
             # n_action_steps chunk; each /predict serves the NEXT queued action. Execute the whole
             # chunk from this one observation (a short open-loop rollout per click, not one step).
-            for i in range(DIFF_CHUNK):
+            # Chunk length = the loaded model's own n_action_steps (imgonly=30, keyboard=8); read from
+            # its config.json (the GUI container mounts /hf), fall back to DIFF_CHUNK.
+            chunk_n = DIFF_CHUNK
+            try:
+                import json as _json
+                with open(os.path.join(self.diff_model_path, "config.json")) as _cf:
+                    chunk_n = max(1, int(_json.load(_cf).get("n_action_steps", DIFF_CHUNK)))
+            except Exception:
+                pass
+            for i in range(chunk_n):
                 if self.estopped:
                     break
                 a = np.asarray(requests.post(f"{VINN_URL}/predict", json=payload, timeout=30).json()["action"],
@@ -2113,7 +2122,7 @@ class TeleopWindow(QtWidgets.QMainWindow):
                 if self.side == "left":
                     self.ctrl.set_hand_manual(hand)    # follow ONLY the model (overrides GUI hand settings)
                 self.diff_step_n += 1
-                self.diff_status.setText(f"chunk {i + 1}/{DIFF_CHUNK}  step {self.diff_step_n}  "
+                self.diff_status.setText(f"chunk {i + 1}/{chunk_n}  step {self.diff_step_n}  "
                                          f"arm {np.round(arm_deg, 1).tolist()}")
                 # let the velocity-clamped arm track this sub-target before the next chunk action
                 for _ in range(30):
