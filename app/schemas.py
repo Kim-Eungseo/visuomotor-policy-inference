@@ -30,6 +30,10 @@ class PredictResponse(BaseModel):
     retrieved: list[dict] | None = Field(
         default=None,
         description="VINN/kNN only: this step's top-k bank neighbors, each {index, weight, epi, frame}")
+    escape: dict | None = Field(
+        default=None,
+        description="VINN loop-break only: set when this step force-advanced out of an idle-loop "
+                    "{epi, from, to, advance}; None otherwise")
 
 
 class LoadRequest(BaseModel):

@@ -114,4 +114,5 @@ def predict(req: PredictRequest) -> PredictResponse:
         logger.exception("prediction failed")
         raise HTTPException(status_code=500, detail=f"inference error: {e}") from e
     retrieved = getattr(runner, "last_retrieval", None)   # kNN runner only; None for diffusion
-    return PredictResponse(action=action.tolist(), retrieved=retrieved)
+    escape = getattr(runner, "last_escape", None)         # kNN loop-break only; None otherwise
+    return PredictResponse(action=action.tolist(), retrieved=retrieved, escape=escape)

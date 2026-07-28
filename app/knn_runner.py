@@ -58,6 +58,22 @@ class KNNPolicyRunner:
         # future N-step action chunk per bank frame (within the same episode; pad by hold-last)
         self.bank_fut = torch.tensor(self._build_future(act, epi, self.N), device=self.device)  # (M,N,26)
 
+        # --- Version A: active loop-break (opt-in via VPI_KNN_LOOPBREAK) ------------------------
+        # After grasping, the query aliases onto the dense grasp-HOLD frames and the top-1 match stops
+        # advancing -> the robot idles in place. When the top-1 (episode, timestep) stays in a tiny band
+        # for LB_WIN steps, we FORCE-ADVANCE: emit the future chunk from LB_ADV*escape timesteps later
+        # in that same episode, pushing the robot along the demo until the observation changes and normal
+        # retrieval resumes. Frames are contiguous per episode, so gidx(episode,frame)=start[e]+frame.
+        self.loopbreak = os.environ.get("VPI_KNN_LOOPBREAK", "0").lower() in ("1", "true", "yes")
+        self.lb_win = int(os.environ.get("VPI_KNN_LB_WIN", "6"))    # stuck if no advance over this many steps
+        self.lb_adv = int(os.environ.get("VPI_KNN_LB_ADV", "4"))    # timesteps to jump forward per stuck step
+        self.lb_tol = int(os.environ.get("VPI_KNN_LB_TOL", "3"))    # frame band width counted as "not advancing"
+        self.epi_start = {int(e): int(np.where(self.epi == e)[0][0]) for e in np.unique(self.epi)}
+        self.epi_len = {int(e): int((self.epi == e).sum()) for e in np.unique(self.epi)}
+        self._recent: deque = deque(maxlen=self.lb_win)   # recent top-1 (epi, frame) matches
+        self._escape = 0                                  # current forward advance (timesteps)
+        self.last_escape: dict | None = None              # provenance of the last forced advance (or None)
+
         self.model = AutoModel.from_pretrained(self.dino).to(self.device).eval()
         for p in self.model.parameters():
             p.requires_grad = False
@@ -78,6 +94,25 @@ class KNNPolicyRunner:
 
     def reset(self) -> None:
         self._hist.clear()   # new episode -> no cross-episode ensembling
+        self._recent.clear(); self._escape = 0; self.last_escape = None   # reset loop-break state
+
+    def _loopbreak(self, chunk, top_gidx):
+        """If the top-1 match has been stuck in a tiny (episode, timestep) band, override `chunk` with
+        the future chunk from further along that same episode (force progress). Returns the chunk to use."""
+        e = int(self.epi[top_gidx]); f = int(self.frame_in_epi[top_gidx])
+        self._recent.append((e, f))
+        stuck = False
+        if len(self._recent) == self._recent.maxlen:
+            es = {p[0] for p in self._recent}; fs = [p[1] for p in self._recent]
+            stuck = (len(es) == 1) and (max(fs) - min(fs) <= self.lb_tol)   # same episode, not advancing
+        if not stuck:
+            self._escape = 0; self.last_escape = None
+            return chunk
+        self._escape += self.lb_adv
+        tgt = min(f + self._escape, self.epi_len[e] - 1)                    # advance along the demo
+        gfwd = self.epi_start[e] + tgt
+        self.last_escape = {"epi": e, "from": f, "to": tgt, "advance": self._escape}
+        return self.bank_fut[gfwd].float().cpu().numpy()
 
     @torch.no_grad()
     def _embed(self, img_uint8_hwc: np.ndarray) -> torch.Tensor:
@@ -105,6 +140,9 @@ class KNNPolicyRunner:
             for j in range(len(_ii))
         ]
 
+        if self.loopbreak:                          # Version A: force-advance out of a detected idle-loop
+            chunk = self._loopbreak(chunk, int(_ii[0]))
+
         if self.N == 1:
             return chunk[0]
         self._hist.append(chunk)
@@ -127,5 +165,7 @@ class KNNPolicyRunner:
             "num_inference_steps": None,
             "knn": {"encoder": self.dino, "bank_size": self.n_bank, "k": self.k, "temp": self.temp,
                     "chunk": self.N, "ensemble_decay": self.ens_m,
-                    "mode": "single-step" if self.N == 1 else "chunk+temporal-ensembling"},
+                    "mode": "single-step" if self.N == 1 else "chunk+temporal-ensembling",
+                    "loopbreak": ({"win": self.lb_win, "adv": self.lb_adv, "tol": self.lb_tol}
+                                  if self.loopbreak else False)},
         }

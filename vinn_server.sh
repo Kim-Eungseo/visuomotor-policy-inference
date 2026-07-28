@@ -9,20 +9,27 @@
 # knn_build_bank.py. This replaces any running vpi_inference container.
 set -uo pipefail
 
-VARIANT="${1:-mask}"    # mask | nomask
-# mask/nomask now point at the FULL-dataset artifacts (110,568 frames / 131 ep) from
+VARIANT="${1:-mask}"    # mask | nomask | pruned | loopbreak
+# mask/nomask now point at the FULL-dataset artifacts (110,568 frames / 131 ep, ep28 removed) from
 # Ngseo/hyundai-uiwang-left:vinn/. (Old 4640-frame teleop_*.npz + vits16_byol_* still in vinn/ if needed.)
+# Two INDEPENDENT anti-idle-loop experiments (test one at a time, A/B against `mask`):
+#   pruned    : same encoder, grasp/hold-pruned bank (left_mask_pruned.npz). loop-break OFF.
+#   loopbreak : same (ep28-removed) bank, active loop-break ON (force-advance on detected idle-loop).
+LOOPBREAK=0
 case "$VARIANT" in
-  mask)   ENC=left_mask;   BANK=left_mask.npz;;
-  nomask) ENC=vits16_byol_nomask; BANK=teleop_nomask.npz;;
-  *) echo "usage: $0 {mask|nomask}"; exit 1;;
+  mask)      ENC=left_mask;          BANK=left_mask.npz;;
+  nomask)    ENC=vits16_byol_nomask; BANK=teleop_nomask.npz;;
+  pruned)    ENC=left_mask;          BANK=left_mask_pruned.npz;;
+  loopbreak) ENC=left_mask;          BANK=left_mask.npz; LOOPBREAK=1;;
+  *) echo "usage: $0 {mask|nomask|pruned|loopbreak}"; exit 1;;
 esac
 
 HF="$HOME/.cache/huggingface"
 K="${VPI_KNN_K:-32}"                    # full-dataset banks -> README recommends k=32
 CHUNK="${VPI_KNN_CHUNK:-8}"   # 8 = chunk + temporal-ensembling (README default); 1 = single-step VINN
+LOOPBREAK="${VPI_KNN_LOOPBREAK:-$LOOPBREAK}"   # 1 = Version A active loop-break (only the loopbreak variant)
 
-echo "[vinn] deploying knn server: encoder=$ENC bank=$BANK k=$K chunk=$CHUNK"
+echo "[vinn] deploying knn server: encoder=$ENC bank=$BANK k=$K chunk=$CHUNK loopbreak=$LOOPBREAK"
 # The forked lerobot diffusion policy (use_robot_state / image-only support) needed to load the
 # Ngseo *-imgonly diffusion checkpoints. Overlaid onto the image's pip lerobot so /load works.
 LR_FORK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/system_Teleop/src/System_/lerobot_system/lerobot/src/lerobot/policies/diffusion"
@@ -42,6 +49,7 @@ docker run -d --name vpi_inference \
   -e VPI_KNN_BANK="/hf/vinn/banks/$BANK" \
   -e VPI_KNN_K="$K" \
   -e VPI_KNN_CHUNK="$CHUNK" \
+  -e VPI_KNN_LOOPBREAK="$LOOPBREAK" \
   -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 \
   visuomotor-policy-inference:latest \
   uvicorn app.server:app --host 0.0.0.0 --port 8000 >/dev/null

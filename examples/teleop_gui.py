@@ -1125,8 +1125,8 @@ class BankGraphDialog(QtWidgets.QDialog):
         self.info.setStyleSheet("font-weight:bold;")
         v.addWidget(self.info)
         v.addWidget(QtWidgets.QLabel("lane = episode  ·  → X = step order  ·  node = (episode, timestep)  ·  "
-                                     "red = returned to same (episode, timestep) = looping  ·  "
-                                     "green ring = current  ·  wheel = zoom, drag = pan"))
+                                     "red = looping  ·  green ring = current  ·  "
+                                     "green ⏩ arrow = loop-break force-advance  ·  wheel = zoom, drag = pan"))
         split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.scene = QtWidgets.QGraphicsScene(self)
         self.view = _GraphView(self.scene)
@@ -1158,12 +1158,15 @@ class BankGraphDialog(QtWidgets.QDialog):
         self.top_idx = {}        # key -> global bank index of its top neighbor (provenance)
         self.loop_edges = set()  # step indices i whose edge seq[i-1]->seq[i] is a return (loop)
         self.loops = 0
+        self.escape_by_node = {}  # node key -> {"to","advance","epi","frm"} : loop-break force-advance marker
+        self.escapes = 0
         if hasattr(self, "loop_log"):
             self.loop_log.clear()
         self._redraw()
 
-    def add_step(self, retrieved):
-        """retrieved: list of {index, weight, epi, frame}. Uses the top-weighted neighbor as the node."""
+    def add_step(self, retrieved, escape=None):
+        """retrieved: list of {index, weight, epi, frame} (top-weighted neighbor -> node).
+        escape: None, or {epi, from, to, advance} when loop-break force-advanced this step."""
         if not retrieved:
             return
         top = max(retrieved, key=lambda r: r.get("weight", 0.0))
@@ -1183,7 +1186,19 @@ class BankGraphDialog(QtWidgets.QDialog):
         self.pos[key] = (epi, frame)
         self.top_idx[key] = idx
         self.seq.append(key)
+        if escape:                                        # loop-break kicked in on this (stuck) node
+            self.escapes += 1
+            self.escape_by_node[key] = {"to": int(escape.get("to", frame)),
+                                        "advance": int(escape.get("advance", 0)),
+                                        "epi": epi, "frm": int(escape.get("from", frame))}
+            self._log_escape(step_no, key, self.escape_by_node[key])
         self._redraw()
+
+    def _log_escape(self, step_no, key, esc):
+        item = (f"⏩ step {step_no}:  loop-break  ep{esc['epi']}  "
+                f"t={esc['frm']} → t={esc['to']}  (+{esc['advance']} advance)")
+        it = QtWidgets.QListWidgetItem(item); it.setForeground(QtGui.QColor("#3cb043"))
+        self.loop_log.addItem(it); self.loop_log.scrollToBottom()
 
     def _log_loop(self, step_no, epi, key, idx):
         ts = key[1] * self.BUCKET                         # timestep (frame-in-episode) of the revisited node
@@ -1209,6 +1224,7 @@ class BankGraphDialog(QtWidgets.QDialog):
     def _redraw(self):
         self.scene.clear()
         self.info.setText(f"steps: {len(self.seq)}    nodes: {len(self.visited)}    loops: {self.loops}"
+                          + (f"    ⏩ loop-break: {self.escapes}" if self.escapes else "")
                           + ("     ⟳ LOOP DETECTED" if self.loops else ""))
         if not self.seq:
             return
@@ -1245,6 +1261,20 @@ class BankGraphDialog(QtWidgets.QDialog):
             if cnt > 1:
                 t = self.scene.addText(str(cnt)); t.setDefaultTextColor(QtGui.QColor("#ffffff"))
                 t.setPos(x - 5, y - 11)
+        # loop-break force-advance markers: a green ⏩ arrow off the stuck node, length ∝ advance,
+        # ending in a green target dot labeled with the forced timestep. Shows where A pushed forward.
+        pen_grn = QtGui.QPen(QtGui.QColor("#3cb043"), 2.4)
+        brush_grn = QtGui.QBrush(QtGui.QColor("#3cb043"))
+        for key, esc in self.escape_by_node.items():
+            if key not in self.pos:
+                continue
+            x, y = xy(key)
+            tx = x + min(esc["advance"], 40) * 3.0 + 24     # push right ∝ advance (capped)
+            ty = y - 22                                     # lift up so it doesn't sit on the lane
+            self.scene.addLine(x, y, tx, ty, pen_grn); self._arrow(x, y, tx, ty, pen_grn)
+            self.scene.addEllipse(tx - 4, ty - 4, 8, 8, pen_grn, brush_grn)
+            t = self.scene.addText(f"⏩t{esc['to']}"); t.setDefaultTextColor(QtGui.QColor("#3cb043"))
+            t.setPos(tx - 6, ty - 20)
         cx, cy = xy(self.seq[-1])                          # green ring on the current node
         self.scene.addEllipse(cx - R - 4, cy - R - 4, 2 * (R + 4), 2 * (R + 4),
                               QtGui.QPen(QtGui.QColor("#3cb043"), 2.5))
@@ -2061,7 +2091,7 @@ class TeleopWindow(QtWidgets.QMainWindow):
             r = requests.post(f"{VINN_URL}/predict", json=payload, timeout=30)
             r.raise_for_status()
             resp = r.json()
-            self.retrieval_sig.emit(resp.get("retrieved"))     # feed the bank-graph loop view
+            self.retrieval_sig.emit((resp.get("retrieved"), resp.get("escape")))   # feed the bank-graph view
             action = np.asarray(resp["action"], dtype=float).reshape(-1)
             if action.shape[0] < 26:
                 self.vinn_status.setText(f"VINN: bad action dim {action.shape}"); return
@@ -2208,10 +2238,11 @@ class TeleopWindow(QtWidgets.QMainWindow):
                 pass
         threading.Thread(target=_do, daemon=True).start()
 
-    def _on_retrieval(self, retrieved):
-        """GUI-thread slot (from retrieval_sig): push a VINN step's bank retrieval to the graph."""
+    def _on_retrieval(self, payload):
+        """GUI-thread slot (from retrieval_sig): push a VINN step's (retrieval, escape) to the graph."""
+        retrieved, escape = payload if isinstance(payload, tuple) else (payload, None)
         if self.bank_graph is not None and self.bank_graph.isVisible():
-            self.bank_graph.add_step(retrieved)
+            self.bank_graph.add_step(retrieved, escape)
 
     def _open_bank_graph(self):
         """Open the directed-graph view of VINN bank retrieval (see if the rollout is looping)."""
