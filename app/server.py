@@ -113,4 +113,5 @@ def predict(req: PredictRequest) -> PredictResponse:
     except Exception as e:  # noqa: BLE001
         logger.exception("prediction failed")
         raise HTTPException(status_code=500, detail=f"inference error: {e}") from e
-    return PredictResponse(action=action.tolist())
+    retrieved = getattr(runner, "last_retrieval", None)   # kNN runner only; None for diffusion
+    return PredictResponse(action=action.tolist(), retrieved=retrieved)

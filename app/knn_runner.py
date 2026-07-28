@@ -47,6 +47,14 @@ class KNNPolicyRunner:
         epi = np.asarray(z["epi"]).reshape(-1) if "epi" in z else np.zeros(len(act), np.int64)
         self.action_dim = int(act.shape[1])
         self.n_bank = int(self.bank.shape[0])
+        # per-bank-frame provenance for retrieval visualization: episode id + position within episode.
+        self.epi = epi.astype(np.int64)
+        self.frame_in_epi = np.zeros(len(epi), np.int64)               # 0-based index of the frame in its episode
+        _seen: dict[int, int] = {}
+        for _i, _e in enumerate(self.epi.tolist()):
+            _seen[_e] = _seen.get(_e, -1) + 1
+            self.frame_in_epi[_i] = _seen[_e]
+        self.last_retrieval: list[dict] | None = None                 # top-k neighbors of the most recent predict
         # future N-step action chunk per bank frame (within the same episode; pad by hold-last)
         self.bank_fut = torch.tensor(self._build_future(act, epi, self.N), device=self.device)  # (M,N,26)
 
@@ -87,6 +95,15 @@ class KNNPolicyRunner:
         vals, idx = torch.topk(q @ self.bank.T, self.k, dim=1)      # (1,k)
         w = torch.softmax(vals / self.temp, dim=1)                  # (1,k)
         chunk = (w[0][:, None, None] * self.bank_fut[idx[0]]).sum(0).float().cpu().numpy()  # (N,26)
+
+        # record which bank frames were retrieved this step (for the loop-visualization graph):
+        # top-k neighbors ordered by weight, each tagged with its source episode + frame-in-episode.
+        _ii = idx[0].detach().cpu().numpy(); _ww = w[0].detach().cpu().numpy()
+        self.last_retrieval = [
+            {"index": int(_ii[j]), "weight": float(_ww[j]),
+             "epi": int(self.epi[_ii[j]]), "frame": int(self.frame_in_epi[_ii[j]])}
+            for j in range(len(_ii))
+        ]
 
         if self.N == 1:
             return chunk[0]

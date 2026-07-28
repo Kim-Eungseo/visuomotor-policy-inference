@@ -27,6 +27,9 @@ class PredictRequest(BaseModel):
 
 class PredictResponse(BaseModel):
     action: list[float] = Field(..., description="target joints (arm 6 + hand 20 = 26)")
+    retrieved: list[dict] | None = Field(
+        default=None,
+        description="VINN/kNN only: this step's top-k bank neighbors, each {index, weight, epi, frame}")
 
 
 class LoadRequest(BaseModel):

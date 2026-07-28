@@ -1085,7 +1085,178 @@ class GripConfigDialog(QtWidgets.QDialog):
     def closeEvent(self, ev): self._release(); ev.accept()
 
 
+class _GraphView(QtWidgets.QGraphicsView):
+    """QGraphicsView with wheel-zoom (nodes keep a constant scene size; the view scales/pans)."""
+    def wheelEvent(self, ev):
+        f = 1.15 if ev.angleDelta().y() > 0 else 1.0 / 1.15
+        self.scale(f, f)
+
+
+class BankGraphDialog(QtWidgets.QDialog):
+    """Directed-graph view of which bank frames the VINN kNN policy retrieves, step by step.
+
+    Layout is a swim-lane per episode: each visited episode is a horizontal lane (labeled 'ep{N}');
+    a VINN step drops ONE node = its top-weighted neighbor at (x = frame within that demo, y = lane).
+    Consecutive steps are joined by directed edges (arrows), so the rollout traces a path through the
+    demonstrations. Loop test is keyed on (episode_id, timestep): when the path RETURNS to the same
+    (episode, timestep) it already passed through (a revisited node that isn't the immediately-previous
+    one) the node + incoming edge turn red, the 'loops' counter ticks up, and a provenance line is
+    logged (which episode + timestep it looped back to, and the cycle length). Node size is fixed —
+    the view scrolls/zooms (mouse wheel, drag to pan) instead of shrinking everything to fit.
+    """
+    # A node's IDENTITY (and the loop test) is keyed on (episode_id, timestep) — NOT episode alone.
+    # timestep = frame-in-episode quantized by BUCKET (small tolerance to absorb top-1 jitter), so two
+    # different points in the SAME episode are different nodes; a loop = the retrieval returns to the
+    # same (episode, timestep) it already passed through = the policy is cycling on that demo frame.
+    BUCKET = 3          # timestep tolerance (frames) for the (episode, timestep) node key
+    COLW = 48          # px per node column: nodes are placed left->right in first-seen (topological)
+                        # order, so a new node always appears in the next column to the right.
+    YS = 66.0          # px per episode lane
+    R = 7              # node radius (fixed, scene units) ; MARGIN reserves room for lane labels
+    MARGIN = 70
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("VINN bank retrieval — loop graph")
+        self.setModal(False)
+        self.resize(860, 620)
+        v = QtWidgets.QVBoxLayout(self)
+        self.info = QtWidgets.QLabel()
+        self.info.setStyleSheet("font-weight:bold;")
+        v.addWidget(self.info)
+        v.addWidget(QtWidgets.QLabel("lane = episode  ·  → X = step order  ·  node = (episode, timestep)  ·  "
+                                     "red = returned to same (episode, timestep) = looping  ·  "
+                                     "green ring = current  ·  wheel = zoom, drag = pan"))
+        split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.scene = QtWidgets.QGraphicsScene(self)
+        self.view = _GraphView(self.scene)
+        self.view.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        self.view.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
+        split.addWidget(self.view)
+        prov = QtWidgets.QWidget(); pv = QtWidgets.QVBoxLayout(prov); pv.setContentsMargins(0, 0, 0, 0)
+        pv.addWidget(QtWidgets.QLabel("Loop provenance — (episode_id, timestep) revisited  "
+                                      "(ep = training-dataset episode index):"))
+        self.loop_log = QtWidgets.QListWidget()
+        pv.addWidget(self.loop_log)
+        split.addWidget(prov)
+        split.setSizes([440, 150])
+        v.addWidget(split, 1)
+        row = QtWidgets.QHBoxLayout(); row.addStretch(1)
+        fit = QtWidgets.QPushButton("Fit"); fit.setFocusPolicy(QtCore.Qt.NoFocus)
+        fit.clicked.connect(self._fit); row.addWidget(fit)
+        clr = QtWidgets.QPushButton("Clear"); clr.setFocusPolicy(QtCore.Qt.NoFocus)
+        clr.clicked.connect(self.clear); row.addWidget(clr)
+        v.addLayout(row)
+        self.clear()
+
+    def clear(self):
+        self.seq = []            # ordered list of node keys (epi, frame_bucket), one per VINN step
+        self.visited = {}        # key -> visit count
+        self.pos = {}            # key -> (epi, frame) for layout
+        self.node_order = []     # keys in first-seen order -> left->right column (topological) X layout
+        self.first_step = {}     # key -> step index (1-based) it was first seen at
+        self.top_idx = {}        # key -> global bank index of its top neighbor (provenance)
+        self.loop_edges = set()  # step indices i whose edge seq[i-1]->seq[i] is a return (loop)
+        self.loops = 0
+        if hasattr(self, "loop_log"):
+            self.loop_log.clear()
+        self._redraw()
+
+    def add_step(self, retrieved):
+        """retrieved: list of {index, weight, epi, frame}. Uses the top-weighted neighbor as the node."""
+        if not retrieved:
+            return
+        top = max(retrieved, key=lambda r: r.get("weight", 0.0))
+        epi, frame = int(top.get("epi", 0)), int(top.get("frame", 0))
+        idx = int(top.get("index", -1))
+        key = (epi, frame // self.BUCKET)
+        step_no = len(self.seq) + 1
+        prev = self.seq[-1] if self.seq else None
+        if key != prev and key in self.visited:          # returned to an earlier region -> loop
+            self.loops += 1
+            self.loop_edges.add(len(self.seq))
+            self._log_loop(step_no, epi, key, idx)
+        if key not in self.visited:
+            self.first_step[key] = step_no
+            self.node_order.append(key)                   # new node -> next column on the right
+        self.visited[key] = self.visited.get(key, 0) + 1
+        self.pos[key] = (epi, frame)
+        self.top_idx[key] = idx
+        self.seq.append(key)
+        self._redraw()
+
+    def _log_loop(self, step_no, epi, key, idx):
+        ts = key[1] * self.BUCKET                         # timestep (frame-in-episode) of the revisited node
+        first = self.first_step.get(key, step_no)
+        cnt = self.visited.get(key, 1) + 1
+        cyc = step_no - first                             # cycle length: steps taken to circle back
+        item = (f"⟳ step {step_no}:  ep{epi} · t={ts}–{ts + self.BUCKET - 1}  "
+                f"·  cycle len {cyc} steps  ·  revisit ×{cnt}  ·  first @ step {first}  ·  bankIdx {idx}")
+        self.loop_log.addItem(item)
+        self.loop_log.scrollToBottom()
+
+    def _arrow(self, x1, y1, x2, y2, pen):
+        ang = math.atan2(y2 - y1, x2 - x1)
+        bx, by = x2 - 10 * math.cos(ang), y2 - 10 * math.sin(ang)   # stop short of the node
+        for s in (0.4, -0.4):
+            self.scene.addLine(bx, by, bx - 9 * math.cos(ang + s), by - 9 * math.sin(ang + s), pen)
+
+    def _fit(self):
+        r = self.scene.itemsBoundingRect().adjusted(-30, -30, 30, 30)
+        if r.width() > 1 and r.height() > 1:
+            self.view.fitInView(r, QtCore.Qt.KeepAspectRatio)
+
+    def _redraw(self):
+        self.scene.clear()
+        self.info.setText(f"steps: {len(self.seq)}    nodes: {len(self.visited)}    loops: {self.loops}"
+                          + ("     ⟳ LOOP DETECTED" if self.loops else ""))
+        if not self.seq:
+            return
+        # X = first-seen (topological) order so new nodes flow left->right; Y = compact episode lane.
+        order = {k: i for i, k in enumerate(self.node_order)}
+        lanes = {e: r for r, e in enumerate(sorted({p[0] for p in self.pos.values()}))}
+
+        def xy(key):
+            e = self.pos[key][0]
+            return self.MARGIN + order[key] * self.COLW, lanes[e] * self.YS
+        # lane baselines + labels (drawn under everything)
+        lane_pen = QtGui.QPen(QtGui.QColor("#3a3a4a"), 1.0)
+        for e, r in lanes.items():
+            xs = [self.MARGIN + order[k] * self.COLW for k in self.pos if k[0] == e]
+            x0 = min(xs) - 12; x1 = max(xs) + 12; y = r * self.YS
+            self.scene.addLine(x0, y, x1, y, lane_pen)
+            t = self.scene.addText(f"ep{e}"); t.setDefaultTextColor(QtGui.QColor("#9aa0b5"))
+            t.setPos(self.MARGIN - 62, y - 11)
+        pen_gray = QtGui.QPen(QtGui.QColor("#888888"), 1.5)
+        pen_red = QtGui.QPen(QtGui.QColor("#e2483a"), 2.6)
+        for i in range(1, len(self.seq)):
+            a, b = self.seq[i - 1], self.seq[i]
+            if a == b:
+                continue                                  # dwell (stayed put) -> no edge
+            x1, y1 = xy(a); x2, y2 = xy(b)
+            pen = pen_red if i in self.loop_edges else pen_gray
+            self.scene.addLine(x1, y1, x2, y2, pen); self._arrow(x1, y1, x2, y2, pen)
+        R = self.R
+        for key, cnt in self.visited.items():
+            x, y = xy(key)
+            col = QtGui.QColor("#e2483a") if cnt > 1 else QtGui.QColor("#4c78c9")
+            self.scene.addEllipse(x - R, y - R, 2 * R, 2 * R,
+                                  QtGui.QPen(QtGui.QColor("#222222")), QtGui.QBrush(col))
+            if cnt > 1:
+                t = self.scene.addText(str(cnt)); t.setDefaultTextColor(QtGui.QColor("#ffffff"))
+                t.setPos(x - 5, y - 11)
+        cx, cy = xy(self.seq[-1])                          # green ring on the current node
+        self.scene.addEllipse(cx - R - 4, cy - R - 4, 2 * (R + 4), 2 * (R + 4),
+                              QtGui.QPen(QtGui.QColor("#3cb043"), 2.5))
+        self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-40, -40, 40, 40))
+        self.view.centerOn(cx, cy)                         # keep the latest node in view (no shrinking)
+
+
 class TeleopWindow(QtWidgets.QMainWindow):
+    # emitted from the VINN worker thread with this step's retrieval payload (list of {index,weight,
+    # epi,frame}); a GUI-thread slot forwards it to the bank-graph window so Qt is only touched here.
+    retrieval_sig = QtCore.pyqtSignal(object)
+
     def __init__(self, ctrl, ik, side, has_arm, has_hand):
         super().__init__()
         self.ctrl, self.ik, self.has_arm, self.has_hand = ctrl, ik, has_arm, has_hand
@@ -1106,6 +1277,7 @@ class TeleopWindow(QtWidgets.QMainWindow):
         self.setStyleSheet(QSS)
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self._build_ui(side)
+        self.retrieval_sig.connect(self._on_retrieval)   # VINN retrieval -> bank-graph window (GUI thread)
         # App-level shortcuts: these fire no matter which child widget holds keyboard focus
         # (keyPressEvent alone is swallowed when e.g. the grip slider is focused). This is what
         # makes '.', ',', 'h' reliable.
@@ -1256,6 +1428,7 @@ class TeleopWindow(QtWidgets.QMainWindow):
         self.policy_btn.setEnabled(self.has_arm or self.has_hand)
         left.addWidget(self.policy_btn)
         self.policy_dialog = None
+        self.bank_graph = None                  # lazily-created BankGraphDialog (VINN retrieval loop viz)
         # Camera input for the policies: RAW by default (the kNN banks were verified to be built from
         # RAW frames — masked input mismatches them). The popup toggle flips this for VINN + diffusion.
         self.mask_input = os.environ.get("VPI_MASK_INPUT", "0").lower() in ("1", "true", "yes")
@@ -1703,8 +1876,10 @@ class TeleopWindow(QtWidgets.QMainWindow):
             pass
         self.ctrl.set_hand_manual(None)
 
-    def _ramp_hand_to(self, target):
-        """Slowly move the DG5F hand to `target` (20-joint) at ~1 rad/s, then hand back to grip."""
+    def _ramp_hand_to(self, target, keep=False):
+        """Slowly move the DG5F hand to `target` (20-joint) at ~1 rad/s. By default hand back to grip
+        control at the end; with keep=True HOLD the manual pose (follow ONLY the model, like diffusion —
+        this preserves the model's thumb instead of snapping it to the staged open pose)."""
         if self.side != "left":
             return
         lh = self.ctrl.last_hand_pose
@@ -1720,7 +1895,10 @@ class TeleopWindow(QtWidgets.QMainWindow):
                     break
                 time.sleep(0.05)
         finally:
-            self._hand_back_to_grip(np.asarray(target, float))   # always drop the manual override
+            if not keep:
+                self._hand_back_to_grip(np.asarray(target, float))   # drop the manual override
+            else:
+                self.ctrl.set_hand_manual(np.asarray(target, float))  # hold the exact model pose
 
     def _run_home(self, pose):
         hand_thread = None
@@ -1882,15 +2060,17 @@ class TeleopWindow(QtWidgets.QMainWindow):
             self.vinn_status.setText("VINN: inferring …")
             r = requests.post(f"{VINN_URL}/predict", json=payload, timeout=30)
             r.raise_for_status()
-            action = np.asarray(r.json()["action"], dtype=float).reshape(-1)
+            resp = r.json()
+            self.retrieval_sig.emit(resp.get("retrieved"))     # feed the bank-graph loop view
+            action = np.asarray(resp["action"], dtype=float).reshape(-1)
             if action.shape[0] < 26:
                 self.vinn_status.setText(f"VINN: bad action dim {action.shape}"); return
             arm_deg = np.degrees(action[:6]); hand = self._grip_boost(action[6:26])   # arm6(rad)+hand20(rad), grip-boosted
             self.vinn_status.setText(f"VINN → arm {np.round(arm_deg, 1).tolist()}")
-            # apply: arm target (velocity-clamped, gradual) + hand slow ramp (then back to grip)
+            # apply: arm target (velocity-clamped, gradual) + hand slow ramp (held, like diffusion)
             self.ctrl.set_arm_tgt(arm_deg)
             if self.side == "left":
-                self._ramp_hand_to(hand)
+                self._ramp_hand_to(hand, keep=True)   # hold the model hand (incl. thumb) like diffusion
             for _ in range(150):                      # wait until the arm reaches (keeps jog blocked)
                 if self.estopped:
                     break
@@ -1949,8 +2129,11 @@ class TeleopWindow(QtWidgets.QMainWindow):
         gvl = QtWidgets.QHBoxLayout(gv)
         self.vinn_btn = QtWidgets.QPushButton("🧠 Run VINN once"); self.vinn_btn.setFocusPolicy(QtCore.Qt.NoFocus)
         self.vinn_btn.clicked.connect(self._vinn_infer)
+        self.bankgraph_btn = QtWidgets.QPushButton("📈 Bank graph"); self.bankgraph_btn.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.bankgraph_btn.setToolTip("Directed graph of which bank frames were retrieved — spot loops")
+        self.bankgraph_btn.clicked.connect(self._open_bank_graph)
         self.vinn_status = QtWidgets.QLabel(""); self.vinn_status.setObjectName("v")
-        gvl.addWidget(self.vinn_btn); gvl.addWidget(self.vinn_status, 1)
+        gvl.addWidget(self.vinn_btn); gvl.addWidget(self.bankgraph_btn); gvl.addWidget(self.vinn_status, 1)
         gv.setEnabled(self.has_arm); v.addWidget(gv)
 
         gd = QtWidgets.QGroupBox("Diffusion policy  (select model -> step-wise inference -> robot)")
@@ -1995,21 +2178,24 @@ class TeleopWindow(QtWidgets.QMainWindow):
         self.diff_step_n = 0
         self.diff_status.setText(f"model: {os.path.basename(self.diff_model_path)}  (click Step to load + run)")
         self._reset_policy_server()
+        if self.bank_graph is not None:
+            self.bank_graph.clear()              # fresh rollout -> fresh retrieval graph
         self.policy_dialog.exec_()               # MODAL: blocks the main window until closed
         self._exit_policy_mode()
 
     def _exit_policy_mode(self):
-        """Leaving the popup: release the policy's hold so teleop resumes cleanly and the arm does NOT
-        rush to the last step pose. Freeze the arm where it is; hand back to normal grip control."""
+        """Leaving the popup: freeze the arm where it is so it does NOT rush to the last step pose.
+        Keep the hand exactly where the model left it (do NOT revert to grip/staged 'offset')."""
         try:
             if self.ctrl is not None:
-                self.ctrl.set_hand_manual(None)                  # hand -> normal grip control
                 cmd, _, _ = self.ctrl.snap()
                 self.ctrl.set_arm_tgt(cmd)                       # freeze arm target at current command
         except Exception:
             pass
         self.diff_stepping = False
         self.diff_step_n = 0
+        if self.bank_graph is not None:
+            self.bank_graph.close()             # close the loop-graph window with the popup
         self._reset_policy_server()
 
     def _reset_policy_server(self):
@@ -2021,6 +2207,18 @@ class TeleopWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         threading.Thread(target=_do, daemon=True).start()
+
+    def _on_retrieval(self, retrieved):
+        """GUI-thread slot (from retrieval_sig): push a VINN step's bank retrieval to the graph."""
+        if self.bank_graph is not None and self.bank_graph.isVisible():
+            self.bank_graph.add_step(retrieved)
+
+    def _open_bank_graph(self):
+        """Open the directed-graph view of VINN bank retrieval (see if the rollout is looping)."""
+        parent = self.policy_dialog if self.policy_dialog is not None else self
+        if self.bank_graph is None:
+            self.bank_graph = BankGraphDialog(parent)
+        self.bank_graph.show(); self.bank_graph.raise_()
 
     def _init_hand(self):
         """Move the DG5F to a neutral (open) start pose so a diffusion rollout begins from a known

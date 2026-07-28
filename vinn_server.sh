@@ -10,25 +10,30 @@
 set -uo pipefail
 
 VARIANT="${1:-mask}"    # mask | nomask
+# mask/nomask now point at the FULL-dataset artifacts (110,568 frames / 131 ep) from
+# Ngseo/hyundai-uiwang-left:vinn/. (Old 4640-frame teleop_*.npz + vits16_byol_* still in vinn/ if needed.)
 case "$VARIANT" in
-  mask)   ENC=vits16_byol_mask;   BANK=teleop_mask.npz;;
+  mask)   ENC=left_mask;   BANK=left_mask.npz;;
   nomask) ENC=vits16_byol_nomask; BANK=teleop_nomask.npz;;
   *) echo "usage: $0 {mask|nomask}"; exit 1;;
 esac
 
 HF="$HOME/.cache/huggingface"
-K="${VPI_KNN_K:-4}"
-CHUNK="${VPI_KNN_CHUNK:-1}"   # 1 = single-step VINN (predict only the current step, no chunk/temporal-ensemble)
+K="${VPI_KNN_K:-32}"                    # full-dataset banks -> README recommends k=32
+CHUNK="${VPI_KNN_CHUNK:-8}"   # 8 = chunk + temporal-ensembling (README default); 1 = single-step VINN
 
 echo "[vinn] deploying knn server: encoder=$ENC bank=$BANK k=$K chunk=$CHUNK"
 # The forked lerobot diffusion policy (use_robot_state / image-only support) needed to load the
 # Ngseo *-imgonly diffusion checkpoints. Overlaid onto the image's pip lerobot so /load works.
 LR_FORK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/system_Teleop/src/System_/lerobot_system/lerobot/src/lerobot/policies/diffusion"
 LR_PKG="/usr/local/lib/python3.11/site-packages/lerobot/policies/diffusion"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 docker rm -f vpi_inference >/dev/null 2>&1 || true
 docker run -d --name vpi_inference \
   --network host --gpus all --restart unless-stopped \
   -v "$HF:/hf" \
+  -v "$REPO/app:/srv/app:ro" \
+  --workdir /srv \
   -v "$LR_FORK/configuration_diffusion.py:$LR_PKG/configuration_diffusion.py:ro" \
   -v "$LR_FORK/modeling_diffusion.py:$LR_PKG/modeling_diffusion.py:ro" \
   -e VPI_DEVICE=cuda \
