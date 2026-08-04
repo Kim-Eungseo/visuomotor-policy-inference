@@ -1,0 +1,94 @@
+{
+  "name": "policy_preprocessor",
+  "steps": [
+    {
+      "registry_name": "rename_observations_processor",
+      "config": {
+        "rename_map": {}
+      }
+    },
+    {
+      "registry_name": "to_batch_processor",
+      "config": {}
+    },
+    {
+      "registry_name": "device_processor",
+      "config": {
+        "device": "cuda",
+        "float_dtype": null
+      }
+    },
+    {
+      "registry_name": "normalizer_processor",
+      "config": {
+        "eps": 1e-08,
+        "features": {
+          "observation.state": {
+            "type": "STATE",
+            "shape": [
+              26
+            ]
+          },
+          "observation.eef": {
+            "type": "STATE",
+            "shape": [
+              6
+            ]
+          },
+          "observation.grip": {
+            "type": "STATE",
+            "shape": [
+              1
+            ]
+          },
+          "observation.images.front": {
+            "type": "VISUAL",
+            "shape": [
+              3,
+              480,
+              640
+            ]
+          },
+          "observation.images.wrist": {
+            "type": "VISUAL",
+            "shape": [
+              3,
+              480,
+              640
+            ]
+          },
+          "action": {
+            "type": "ACTION",
+            "shape": [
+              26
+            ]
+          },
+          "action.eef": {
+            "type": "ACTION",
+            "shape": [
+              6
+            ]
+          },
+          "action.grip": {
+            "type": "ACTION",
+            "shape": [
+              1
+            ]
+          },
+          "action.key": {
+            "type": "ACTION",
+            "shape": [
+              7
+            ]
+          }
+        },
+        "norm_map": {
+          "VISUAL": "IDENTITY",
+          "STATE": "MIN_MAX",
+          "ACTION": "MIN_MAX"
+        }
+      },
+      "state_file": "policy_preprocessor_step_3_normalizer_processor.safetensors"
+    }
+  ]
+}

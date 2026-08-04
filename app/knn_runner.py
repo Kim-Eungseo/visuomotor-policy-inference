@@ -4,15 +4,23 @@ The kNN policy serves two artifacts (no trained action head):
   1. a frozen DINOv3 image encoder, and
   2. an embedding memory bank (.npz: emb (N,D) unit-norm, act (N,26), epi (N,) episode index).
 
-Inference (per control tick): encode front+wrist -> cosine kNN over the bank -> locally-
-weighted average of the neighbors' *future N-step action chunks* (built at load time from
-act+epi). A small ring buffer of recent chunk predictions is temporally ensembled so the
-action for the current frame is the (recency-weighted) average of every overlapping chunk
-that targets it — the retrieval-native equivalent of RTC's smooth chunk stitching.
-Set VPI_KNN_CHUNK=1 to fall back to plain single-step VINN.
+Inference (per control tick): encode front+wrist -> kNN over the bank (embeddings are unit-norm,
+so cosine topk == L2-distance topk) -> locally-weighted average of the neighbors' *future N-step
+action chunks* (built at load time from act+epi). A small ring buffer of recent chunk predictions
+is temporally ensembled so the action for the current frame is the (recency-weighted) average of
+every overlapping chunk that targets it — the retrieval-native equivalent of RTC's smooth chunk
+stitching. Set VPI_KNN_CHUNK=1 to fall back to plain single-step VINN.
 
-Env: VPI_KNN_BANK, VPI_KNN_DINO, VPI_KNN_K (32), VPI_KNN_TEMP (0.05),
-     VPI_KNN_CHUNK (chunk length N, default 8), VPI_KNN_ENS_M (ensemble decay, default 0.1).
+Neighbor weighting (VPI_KNN_WEIGHT):
+  softmin_l2 (default) — VINN paper III-B / Atkeson LWR: w_i = softmax(-||e - e_i||_2 / bw).
+      Paper-exact is bw=1 (no bandwidth term). NOTE: with unit-norm embeddings d in [0,2], so
+      exp(-d) weight ratios are <= e^2 (~7.4x) — much flatter than the legacy softmax.
+      VPI_KNN_BW tunes the bandwidth the paper leaves implicit.
+  softmax_cos — legacy: w_i = softmax(cos_sim / VPI_KNN_TEMP), temp 0.05 (sharply peaked).
+
+Env: VPI_KNN_BANK, VPI_KNN_DINO, VPI_KNN_K (32), VPI_KNN_WEIGHT (softmin_l2), VPI_KNN_BW (1.0),
+     VPI_KNN_TEMP (0.05, softmax_cos only), VPI_KNN_CHUNK (chunk length N, default 8),
+     VPI_KNN_ENS_M (ensemble decay, default 0.1).
 """
 from __future__ import annotations
 
@@ -34,6 +42,8 @@ class KNNPolicyRunner:
         self.device = dev if (dev != "cuda" or torch.cuda.is_available()) else "cpu"
         self.k = int(k or os.environ.get("VPI_KNN_K", "32"))
         self.temp = float(temp or os.environ.get("VPI_KNN_TEMP", "0.05"))
+        self.weight = os.environ.get("VPI_KNN_WEIGHT", "softmin_l2")      # paper III-B | "softmax_cos" legacy
+        self.bw = float(os.environ.get("VPI_KNN_BW", "1.0"))              # softmin bandwidth; 1.0 = paper-exact
         self.N = max(1, int(os.environ.get("VPI_KNN_CHUNK", "8")))       # chunk length (1 = single-step)
         self.ens_m = float(os.environ.get("VPI_KNN_ENS_M", "0.1"))       # temporal-ensemble recency decay
         # which camera(s) to encode into the query embedding — must match how the bank was built.
@@ -127,8 +137,12 @@ class KNNPolicyRunner:
         # image-only: state/gripper/ft accepted (server drop-in) but ignored.
         imgs = {"front": front_rgb, "wrist": wrist_rgb}
         q = F.normalize(torch.cat([self._embed(imgs[c]) for c in self.cams], dim=-1), dim=-1)
-        vals, idx = torch.topk(q @ self.bank.T, self.k, dim=1)      # (1,k)
-        w = torch.softmax(vals / self.temp, dim=1)                  # (1,k)
+        vals, idx = torch.topk(q @ self.bank.T, self.k, dim=1)      # (1,k) cosine; same ranking as L2
+        if self.weight == "softmax_cos":                            # legacy sharp weighting
+            w = torch.softmax(vals / self.temp, dim=1)              # (1,k)
+        else:                                                       # VINN III-B: softmin of L2 distances
+            d = (2.0 - 2.0 * vals).clamp_min(0).sqrt()              # unit-norm: ||e-e_i|| = sqrt(2-2cos)
+            w = torch.softmax(-d / self.bw, dim=1)                  # (1,k); bw=1 -> exp(-d)/sum exp(-d)
         chunk = (w[0][:, None, None] * self.bank_fut[idx[0]]).sum(0).float().cpu().numpy()  # (N,26)
 
         # record which bank frames were retrieved this step (for the loop-visualization graph):
@@ -163,7 +177,9 @@ class KNNPolicyRunner:
             "action_dim": self.action_dim,
             "scheduler": "knn-vinn",
             "num_inference_steps": None,
-            "knn": {"encoder": self.dino, "bank_size": self.n_bank, "k": self.k, "temp": self.temp,
+            "knn": {"encoder": self.dino, "bank_size": self.n_bank, "k": self.k,
+                    "weighting": self.weight,
+                    **({"bandwidth": self.bw} if self.weight != "softmax_cos" else {"temp": self.temp}),
                     "chunk": self.N, "ensemble_decay": self.ens_m,
                     "mode": "single-step" if self.N == 1 else "chunk+temporal-ensembling",
                     "loopbreak": ({"win": self.lb_win, "adv": self.lb_adv, "tol": self.lb_tol}
