@@ -33,9 +33,13 @@ def main():
     ap.add_argument("--holdout", type=int, default=26)
     ap.add_argument("--qstride", type=int, default=5)
     ap.add_argument("--cache", default=None, help="npz cache path (default derived from ckpt name)")
+    ap.add_argument("--crop_bottom", type=float, default=0.0, help="front crop, must match training")
+    ap.add_argument("--crop_side", type=float, default=0.0, help="front crop, must match training")
     args = ap.parse_args()
 
     tag = "frozen" if not args.ckpt else os.path.basename(args.ckpt).replace(".pt", "")
+    if args.crop_bottom or args.crop_side:
+        tag += f"_cb{args.crop_bottom}_cs{args.crop_side}"
     cache = args.cache or f"/tmp/emb_left_{tag}.npz"
 
     if os.path.exists(cache):
@@ -53,8 +57,13 @@ def main():
             p.requires_grad = False
 
         @torch.no_grad()
-        def enc(x):
-            x = F.interpolate(x.to(DEV), size=(224, 224), mode="bilinear", align_corners=False)
+        def enc(x, crop=False):
+            x = x.to(DEV)
+            if crop and (args.crop_bottom or args.crop_side):   # front-only task-region crop
+                H, W = x.shape[-2:]
+                x = x[..., :int(H * (1 - args.crop_bottom)),
+                      int(W * args.crop_side):W - int(W * args.crop_side)]
+            x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
             x = (x.clamp(0, 1) - MEAN) / STD
             return F.normalize(model(pixel_values=x).last_hidden_state[:, 0], dim=-1)
 
@@ -65,7 +74,7 @@ def main():
         E, A, P, I = [], [], [], []
         done = 0
         for nb, b in enumerate(dl):
-            e = F.normalize(torch.cat([enc(b[fkey]), enc(b[wkey])], dim=-1), dim=-1)
+            e = F.normalize(torch.cat([enc(b[fkey], crop=True), enc(b[wkey])], dim=-1), dim=-1)
             E.append(e.cpu().numpy().astype(np.float16))
             A.append(np.asarray(b["action"], np.float32))
             P.append(np.asarray(b["episode_index"]).reshape(-1))

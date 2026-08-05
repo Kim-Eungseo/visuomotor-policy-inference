@@ -18,6 +18,10 @@ frame-discrimination (alignment + uniformity) that kNN needs, where BYOL only pu
     crops from other frames pasted into the border band (outer 25%; center untouched). Views are
     perturbed independently, so positives pair (cluttered, clean) -> robustness to unexpected
     objects at the image periphery.
+  - --crop_bottom/--crop_side: task-region crop of the FRONT camera (wrist untouched) applied at
+    preload, before any augmentation. E.g. 0.3/0.15 keeps the top 70% x center 70% of the frame.
+    The hand+hook masks get the identical crop. Eval MUST use the same flags (left_knn_eval.py
+    --crop_bottom/--crop_side) so bank and query see the same view.
 Preload/holdout/stride identical to left_byol.py; checkpoints stay {"backbone": ...} so
 left_knn_eval.py --ckpt works unchanged.
 
@@ -179,6 +183,8 @@ def main():
     ap.add_argument("--use_mask", type=int, default=0, help="background-swap augmentation on front views")
     ap.add_argument("--bg_p", type=float, default=0.5, help="prob a front view gets its background swapped")
     ap.add_argument("--edge_p", type=float, default=0.0, help="prob a front view gets border-band clutter patches")
+    ap.add_argument("--crop_bottom", type=float, default=0.0, help="cut this fraction off the front image bottom")
+    ap.add_argument("--crop_side", type=float, default=0.0, help="cut this fraction off each front image side")
     ap.add_argument("--mask_npz", default="masks_left_stride3.npz")
     ap.add_argument("--save_every", type=int, default=2)
     ap.add_argument("--out", default="infonce_left.pt")
@@ -215,13 +221,19 @@ def main():
             for key, buf in ((fkey, F_), (wkey, W_)):
                 x = b[key][keep].to(dev)                                   # (k,3,480,640) float [0,1]
                 x = F.interpolate(x, size=(240, 320), mode="bilinear", align_corners=False)
+                if key == fkey and (args.crop_bottom or args.crop_side):   # front-only task-region crop
+                    x = x[:, :, :int(240 * (1 - args.crop_bottom)),
+                          int(320 * args.crop_side):320 - int(320 * args.crop_side)]
                 buf.append((x * 255).round().clamp(0, 255).to(torch.uint8).cpu())
             E_.append(epi[keepn]); T_.append(fi[keepn])
             if args.use_mask:
                 rows = [mrow[(int(e), int(f))] for e, f in zip(epi[keepn], fi[keepn])]
                 mb = np.unpackbits(mpacked[rows], axis=-1)[:, :, :640]     # (k,480,640) {0,1}
+                if args.crop_bottom or args.crop_side:                     # identical crop at mask res
+                    mb = mb[:, :int(480 * (1 - args.crop_bottom)),
+                            int(640 * args.crop_side):640 - int(640 * args.crop_side)]
                 mt = torch.from_numpy(mb).float().unsqueeze(1).to(dev)
-                mt = F.max_pool2d(mt, 2)                                   # (k,1,240,320) keep thin hooks
+                mt = F.max_pool2d(mt, 2)                                   # 2x downsample, keep thin hooks
                 M_.append((mt > 0).to(torch.uint8).cpu())
         if nb % 60 == 0:
             print(f"  preload {done}/{len(ds)} (kept {sum(t.shape[0] for t in F_)})", flush=True)
@@ -229,8 +241,8 @@ def main():
     epi_r, fi_r = np.concatenate(E_), np.concatenate(T_)
     mask = torch.cat(M_) if args.use_mask else None
     del F_, W_, E_, T_, M_
-    print(f"preloaded {front.shape[0]} train frames at 240x320 (~{front.numel() * 2 / 1e9:.1f}GB RAM) "
-          f"| use_mask={args.use_mask}", flush=True)
+    print(f"preloaded {front.shape[0]} train frames | front {tuple(front.shape[2:])} wrist {tuple(wrist.shape[2:])} "
+          f"| use_mask={args.use_mask} crop=({args.crop_bottom},{args.crop_side})", flush=True)
 
     dl = DataLoader(Pairs(front, wrist, epi_r, fi_r, args.tcn_p, args.tcn_win, args.stride,
                           mask=mask, bg_p=args.bg_p, edge_p=args.edge_p),

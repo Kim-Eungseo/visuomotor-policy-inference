@@ -1,39 +1,38 @@
-# VINN artifacts (BYOL-finetuned DINOv3-ViTS16 + kNN banks) — MAIN left set
+# VINN artifacts — MAIN left set (InfoNCE era)
 
-Non-parametric VINN policy artifacts built from **this dataset's full 110,568 frames (131 episodes,
-30fps)**. Two BYOL-finetuned DINOv3-ViT-S/16 encoders + their full-dataset kNN banks, drop-in for the
-`visuomotor-policy-inference` kNN runner (`app/knn_runner.py`).
+Non-parametric VINN policy artifacts for the left arm, built from the full 110,568-frame /
+131-episode dataset (30fps). Drop-in for `app/knn_runner.py`. Published (current champion +
+maskcat bank) at **hf.co/Ngseo/hyundai-uiwang-left-vinn**; this dir keeps local copies and the
+legacy variants. Weights/banks are gitignored — only configs/READMEs are in git.
 
 ## Contents
 ```
-vinn/
+left_vinn/
   encoders/
-    vits16_byol_nomask/   # plain 2-aug BYOL (front,wrist)          <- RECOMMENDED (A/B winner)
-    vits16_byol_mask/     # + (front <-> front*hand+hook-mask) background-invariance positive
+    vits16_infonce_mask12_e6/  # CHAMPION: InfoNCE + bg-swap + edge-clutter augs, epoch 6
+    vits16_infonce_e2/         # InfoNCE, aug-only positives (first InfoNCE release)
+    vits16_byol_nomask/        # legacy BYOL winner
+    vits16_byol_mask/          # legacy BYOL + invariance-positive (lost its A/B)
   banks/
-    left_nomask.npz       # emb(110568,768) act(110568,26) epi -- encoded by vits16_byol_nomask
-    left_mask.npz         # encoded by vits16_byol_mask
+    left_infonce_mask12.npz    # emb(110568,768) act(110568,26) epi — by mask12_e6  <- SERVING
+    left_infonce.npz           # by infonce_e2
+    left_maskcat_stride3.npz   # cf/cw/mp(fp16)+act/epi/fi, stride-3 all eps — maskcat experiment
+    left_nomask.npz, left_mask.npz  # legacy BYOL banks
 ```
-Encoders: BYOL epoch-6, trained on stride-3 frames of the first 105 episodes (last 26 held out for the
-eval below), last-2-blocks unfrozen. Banks: L2-normalized `concat(front_CLS, wrist_CLS)` for **all 131
-episodes** + 26-d action + episode index. Masks came from `Ngseo/hyundai-uiwang-hook-segmentation`.
+Rebuild any of these with `python build_left_vinn.py <name-filter>` (needs the /tmp eval caches).
 
-## Held-out kNN L1 (105-ep bank -> 26-ep query, lower is better)
-| encoder            | k=1    | k=8    | k=32   |
-|--------------------|--------|--------|--------|
-| frozen DINOv3      | 0.0913 | 0.0773 | 0.0730 |
-| **byol_nomask e6** | 0.0806 | 0.0694 | **0.0651** |
-| byol_mask e6       | 0.0832 | 0.0725 | 0.0686 |
+## Results (26-ep holdout; full history in the HF model card)
+- Clean kNN L1 @k=32: frozen 0.0730 → BYOL 0.0651 → **InfoNCE family 0.0633–0.0634** (ceiling;
+  ±TCN, ±mask, ±edge, 6 vs 12 epochs all converge there).
+- Perturbed-holdout (`left_robust_eval.py`): under front clutter, nomask degrades +4.9% vs
+  **mask12 +0.8%** — the offline signature of the real-robot mask advantage.
+- Mask-latent concat retrieval (`left_maskcat_eval.py`): null — α≤0.5 flat, α≥1 worse.
 
-Plain BYOL cuts L1 ~11% vs frozen. The hand+hook background-invariance positive is consistently ~0.004
-WORSE at every epoch (hand+hook is only ~2.4% of the frame — forcing invariance to the other 97.6%
-discards retrieval-relevant context). **Use `vits16_byol_nomask` + `left_nomask.npz`.**
-
-## Serve (chunk + temporal-ensembling VINN)
+## Serve
 ```bash
 export VPI_POLICY=knn
-export VPI_KNN_DINO=vinn/encoders/vits16_byol_nomask
-export VPI_KNN_BANK=vinn/banks/left_nomask.npz
-# runner defaults: k=32, chunk=8, temporal-ensemble -> single 26-d action per tick
+export VPI_KNN_DINO=left_vinn/encoders/vits16_infonce_mask12_e6
+export VPI_KNN_BANK=left_vinn/banks/left_infonce_mask12.npz
+# k=32, softmin-L2 weighting (VINN paper III-B) by default; VPI_KNN_WEIGHT=softmax_cos for legacy
 python -m uvicorn app.server:app --host 0.0.0.0 --port 8000
 ```
