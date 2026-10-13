@@ -35,24 +35,38 @@ def main():
     ap.add_argument("--cache", default=None, help="npz cache path (default derived from ckpt name)")
     ap.add_argument("--crop_bottom", type=float, default=0.0, help="front crop, must match training")
     ap.add_argument("--crop_side", type=float, default=0.0, help="front crop, must match training")
+    ap.add_argument("--arch", default="dino", choices=["dino", "resnet50"],
+                    help="frozen-eval encoder; ckpts carry their own arch")
+    ap.add_argument("--side", default="left", choices=["left", "right"])
     args = ap.parse_args()
 
-    tag = "frozen" if not args.ckpt else os.path.basename(args.ckpt).replace(".pt", "")
+    tag = (("frozen" if args.arch == "dino" else f"frozen_{args.arch}")
+           if not args.ckpt else os.path.basename(args.ckpt).replace(".pt", ""))
     if args.crop_bottom or args.crop_side:
         tag += f"_cb{args.crop_bottom}_cs{args.crop_side}"
-    cache = args.cache or f"/tmp/emb_left_{tag}.npz"
+    cache = args.cache or f"/tmp/emb_{args.side}_{tag}.npz"
 
     if os.path.exists(cache):
         z = np.load(cache)
         emb, act, epi, fi = z["emb"].astype(np.float32), z["act"], z["epi"], z["fi"]
         print(f"[{tag}] cache hit {cache}: emb{emb.shape}", flush=True)
     else:
-        model = AutoModel.from_pretrained(DINO).to(DEV).eval()
+        sd, arch = None, args.arch
         if args.ckpt:
-            sd = torch.load(args.ckpt, map_location=DEV)
-            sd = sd.get("backbone", sd)
+            raw = torch.load(args.ckpt, map_location=DEV)
+            arch = raw.get("arch", args.arch) if isinstance(raw, dict) else args.arch
+            sd = raw.get("backbone", raw)
+        if arch == "resnet50":
+            import torchvision
+            model = torchvision.models.resnet50(
+                weights=None if sd else torchvision.models.ResNet50_Weights.IMAGENET1K_V2)
+            model.fc = torch.nn.Identity()
+            model = model.to(DEV).eval()
+        else:
+            model = AutoModel.from_pretrained(DINO).to(DEV).eval()
+        if sd is not None:
             miss, unexp = model.load_state_dict(sd, strict=False)
-            print(f"[{tag}] loaded ckpt (missing={len(miss)} unexpected={len(unexp)})", flush=True)
+            print(f"[{tag}] loaded ckpt arch={arch} (missing={len(miss)} unexpected={len(unexp)})", flush=True)
         for p in model.parameters():
             p.requires_grad = False
 
@@ -65,9 +79,13 @@ def main():
                       int(W * args.crop_side):W - int(W * args.crop_side)]
             x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
             x = (x.clamp(0, 1) - MEAN) / STD
-            return F.normalize(model(pixel_values=x).last_hidden_state[:, 0], dim=-1)
+            h = model(x) if arch == "resnet50" else model(pixel_values=x).last_hidden_state[:, 0]
+            return F.normalize(h, dim=-1)
 
-        ds = LeRobotDataset(REPO, root=ROOT, revision="main")
+        repo = f"Ngseo/hyundai-uiwang-{args.side}"
+        root = os.environ.get(f"VPI_{args.side.upper()}_ROOT",
+                              f"/home/ngseo/remove_hook/lerobot/data/lerobot/hyundai_uiwang_{args.side}")
+        ds = LeRobotDataset(repo, root=root, revision="main")
         fkey = next(k for k in ds.meta.camera_keys if "front" in k)
         wkey = next(k for k in ds.meta.camera_keys if "wrist" in k)
         dl = DataLoader(ds, batch_size=128, num_workers=6, shuffle=False)

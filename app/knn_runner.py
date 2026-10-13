@@ -18,13 +18,28 @@ Neighbor weighting (VPI_KNN_WEIGHT):
       VPI_KNN_BW tunes the bandwidth the paper leaves implicit.
   softmax_cos — legacy: w_i = softmax(cos_sim / VPI_KNN_TEMP), temp 0.05 (sharply peaked).
 
+Neighbor SELECTION (VPI_KNN_SELECT) — the RL v1 hook (see VINN_RL_PLAN.md):
+  softmin (default) — execute the weighted AVERAGE of the top-k chunks (previous behavior).
+  top1 / thompson — pick ONE candidate among the top-k and execute its chunk:
+      score_i = exp(-||e-e_i||/bw) * v_i * prog_i
+      v_i = posterior mean (top1) or Beta sample (thompson) from the per-entry value sidecar
+      (VPI_KNN_VALUES npz: alpha, beta aligned to bank rows; missing file -> uniform prior 3/1),
+      prog_i = VPI_KNN_PROG_GAMMA^backstep vs the last selected (episode, frame) — the learned-
+      value generalization of the loop-break heuristic. If every candidate's posterior mean is
+      below VPI_KNN_VMIN the tick falls back to softmin (safety net).
+  Per-tick JSONL logs (candidates/distances/selection) go to VPI_KNN_LOG_DIR when set, one file
+  per episode (rotated on reset()); update_values.py turns logs + episode labels into the sidecar.
+
 Env: VPI_KNN_BANK, VPI_KNN_DINO, VPI_KNN_K (32), VPI_KNN_WEIGHT (softmin_l2), VPI_KNN_BW (1.0),
      VPI_KNN_TEMP (0.05, softmax_cos only), VPI_KNN_CHUNK (chunk length N, default 8),
-     VPI_KNN_ENS_M (ensemble decay, default 0.1).
+     VPI_KNN_ENS_M (ensemble decay, default 0.1), VPI_KNN_SELECT (softmin), VPI_KNN_VALUES,
+     VPI_KNN_VMIN (0.2), VPI_KNN_PROG_GAMMA (0.98), VPI_KNN_LOG_DIR.
 """
 from __future__ import annotations
 
+import json
 import os
+import time
 from collections import deque
 
 import numpy as np
@@ -65,6 +80,26 @@ class KNNPolicyRunner:
             _seen[_e] = _seen.get(_e, -1) + 1
             self.frame_in_epi[_i] = _seen[_e]
         self.last_retrieval: list[dict] | None = None                 # top-k neighbors of the most recent predict
+
+        # --- RL v1: single-candidate selection + per-entry value sidecar (VINN_RL_PLAN.md) -----
+        self.select = os.environ.get("VPI_KNN_SELECT", "softmin")     # softmin | top1 | thompson
+        self.vmin = float(os.environ.get("VPI_KNN_VMIN", "0.2"))
+        self.prog_gamma = float(os.environ.get("VPI_KNN_PROG_GAMMA", "0.98"))
+        vpath = os.environ.get("VPI_KNN_VALUES", "")
+        if vpath and os.path.exists(vpath):
+            vz = np.load(vpath)
+            self.val_a = np.asarray(vz["alpha"], np.float64)
+            self.val_b = np.asarray(vz["beta"], np.float64)
+            assert len(self.val_a) == self.n_bank, "value sidecar / bank size mismatch"
+            print(f"[knn] value sidecar {vpath}: mean v={float((self.val_a/(self.val_a+self.val_b)).mean()):.3f}")
+        else:                                                          # uniform demo prior
+            self.val_a = np.full(self.n_bank, 3.0)
+            self.val_b = np.ones(self.n_bank)
+        self._last_sel: tuple[int, int] | None = None                  # (episode, frame) of last selection
+        self.last_selected: int | None = None                          # global bank idx picked this tick
+        self.log_dir = os.environ.get("VPI_KNN_LOG_DIR", "")
+        self._log_f = None
+        self._tick = 0
         # future N-step action chunk per bank frame (within the same episode; pad by hold-last)
         self.bank_fut = torch.tensor(self._build_future(act, epi, self.N), device=self.device)  # (M,N,26)
 
@@ -105,6 +140,18 @@ class KNNPolicyRunner:
     def reset(self) -> None:
         self._hist.clear()   # new episode -> no cross-episode ensembling
         self._recent.clear(); self._escape = 0; self.last_escape = None   # reset loop-break state
+        self._last_sel = None
+        if self._log_f:                                   # rotate the per-episode selection log
+            self._log_f.close(); self._log_f = None
+        self._tick = 0
+
+    def _log_tick(self, rec: dict) -> None:
+        if not self.log_dir:
+            return
+        if self._log_f is None:
+            os.makedirs(self.log_dir, exist_ok=True)
+            self._log_f = open(os.path.join(self.log_dir, f"ep_{int(time.time() * 1000)}.jsonl"), "a")
+        self._log_f.write(json.dumps(rec) + "\n"); self._log_f.flush()
 
     def _loopbreak(self, chunk, top_gidx):
         """If the top-1 match has been stuck in a tiny (episode, timestep) band, override `chunk` with
@@ -143,19 +190,45 @@ class KNNPolicyRunner:
         else:                                                       # VINN III-B: softmin of L2 distances
             d = (2.0 - 2.0 * vals).clamp_min(0).sqrt()              # unit-norm: ||e-e_i|| = sqrt(2-2cos)
             w = torch.softmax(-d / self.bw, dim=1)                  # (1,k); bw=1 -> exp(-d)/sum exp(-d)
-        chunk = (w[0][:, None, None] * self.bank_fut[idx[0]]).sum(0).float().cpu().numpy()  # (N,26)
+
+        _ii = idx[0].detach().cpu().numpy(); _ww = w[0].detach().cpu().numpy()
+        dnp = np.sqrt(np.clip(2.0 - 2.0 * vals[0].detach().cpu().numpy(), 0, None))
+        self.last_selected, fallback = None, False
+        if self.select != "softmin":                # RL v1: pick ONE candidate by dist x value x progress
+            pm = self.val_a[_ii] / (self.val_a[_ii] + self.val_b[_ii])
+            if pm.max() < self.vmin:                # every candidate has a bad record -> softmin safety net
+                fallback = True
+            else:
+                v = np.random.beta(self.val_a[_ii], self.val_b[_ii]) if self.select == "thompson" else pm
+                prog = np.ones(len(_ii))
+                if self._last_sel is not None:      # penalize going backwards along the last-followed demo
+                    le, lf = self._last_sel
+                    back = np.maximum(0, lf - self.frame_in_epi[_ii])
+                    prog = np.where(self.epi[_ii] == le, self.prog_gamma ** back, 1.0)
+                score = np.exp(-dnp / self.bw) * v * prog
+                j = int(score.argmax())
+                self.last_selected = int(_ii[j])
+                self._last_sel = (int(self.epi[_ii[j]]), int(self.frame_in_epi[_ii[j]]))
+        if self.last_selected is not None:
+            chunk = self.bank_fut[self.last_selected].float().cpu().numpy()            # (N,26) one entry
+        else:
+            chunk = (w[0][:, None, None] * self.bank_fut[idx[0]]).sum(0).float().cpu().numpy()
 
         # record which bank frames were retrieved this step (for the loop-visualization graph):
         # top-k neighbors ordered by weight, each tagged with its source episode + frame-in-episode.
-        _ii = idx[0].detach().cpu().numpy(); _ww = w[0].detach().cpu().numpy()
         self.last_retrieval = [
             {"index": int(_ii[j]), "weight": float(_ww[j]),
-             "epi": int(self.epi[_ii[j]]), "frame": int(self.frame_in_epi[_ii[j]])}
+             "epi": int(self.epi[_ii[j]]), "frame": int(self.frame_in_epi[_ii[j]]),
+             "selected": self.last_selected == int(_ii[j])}
             for j in range(len(_ii))
         ]
+        self._tick += 1
+        self._log_tick({"t": self._tick, "mode": self.select, "sel": self.last_selected,
+                        "fallback": fallback, "cand": [int(x) for x in _ii],
+                        "dist": [round(float(x), 4) for x in dnp]})
 
         if self.loopbreak:                          # Version A: force-advance out of a detected idle-loop
-            chunk = self._loopbreak(chunk, int(_ii[0]))
+            chunk = self._loopbreak(chunk, self.last_selected if self.last_selected is not None else int(_ii[0]))
 
         if self.N == 1:
             return chunk[0]
@@ -178,6 +251,10 @@ class KNNPolicyRunner:
             "scheduler": "knn-vinn",
             "num_inference_steps": None,
             "knn": {"encoder": self.dino, "bank_size": self.n_bank, "k": self.k,
+                    "select": self.select,
+                    **({"prog_gamma": self.prog_gamma, "vmin": self.vmin,
+                        "values_mean": float((self.val_a / (self.val_a + self.val_b)).mean())}
+                       if self.select != "softmin" else {}),
                     "weighting": self.weight,
                     **({"bandwidth": self.bw} if self.weight != "softmax_cos" else {"temp": self.temp}),
                     "chunk": self.N, "ensemble_decay": self.ens_m,

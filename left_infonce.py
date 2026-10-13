@@ -185,6 +185,10 @@ def main():
     ap.add_argument("--edge_p", type=float, default=0.0, help="prob a front view gets border-band clutter patches")
     ap.add_argument("--crop_bottom", type=float, default=0.0, help="cut this fraction off the front image bottom")
     ap.add_argument("--crop_side", type=float, default=0.0, help="cut this fraction off each front image side")
+    ap.add_argument("--arch", default="dino", choices=["dino", "resnet50"],
+                    help="encoder: DINOv3-ViTS16 (unfreeze last N blocks) or IN-pretrained ResNet-50 (unfreeze layer4)")
+    ap.add_argument("--side", default="left", choices=["left", "right"],
+                    help="which arm's dataset (right: INSPIRE hand, action dims 12-25 are constant-0)")
     ap.add_argument("--mask_npz", default="masks_left_stride3.npz")
     ap.add_argument("--save_every", type=int, default=2)
     ap.add_argument("--out", default="infonce_left.pt")
@@ -193,12 +197,15 @@ def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ---- preload: every `stride`-th frame of train episodes, downscaled to 240x320 uint8 ----
-    ds = LeRobotDataset(REPO, root=ROOT, revision="main")
+    repo = f"Ngseo/hyundai-uiwang-{args.side}"
+    root = os.environ.get(f"VPI_{args.side.upper()}_ROOT",
+                          f"/home/ngseo/remove_hook/lerobot/data/lerobot/hyundai_uiwang_{args.side}")
+    ds = LeRobotDataset(repo, root=root, revision="main")
     fkey = next(k for k in ds.meta.camera_keys if "front" in k)
     wkey = next(k for k in ds.meta.camera_keys if "wrist" in k)
     n_ep = ds.num_episodes
     lim = n_ep - args.holdout
-    print(f"{REPO}: {len(ds)} frames / {n_ep} eps | train eps < {lim} | stride {args.stride} | keys {fkey},{wkey}",
+    print(f"{repo}: {len(ds)} frames / {n_ep} eps | train eps < {lim} | stride {args.stride} | keys {fkey},{wkey}",
           flush=True)
 
     mrow = mpacked = None
@@ -249,17 +256,36 @@ def main():
                     batch_size=args.bs, shuffle=True, num_workers=6, drop_last=True,
                     persistent_workers=True)
 
-    # ---- SimCLR-style: backbone + projector, loss on projector output, bank uses raw CLS ----
-    bb = unfreeze_last(AutoModel.from_pretrained(DINO).to(dev), args.unfreeze)
-    projector = mlp(bb.config.hidden_size, 1024, 256).to(dev)
+    # ---- SimCLR-style: backbone + projector, loss on projector output, bank uses raw features ----
+    if args.arch == "resnet50":
+        import torchvision
+        bb = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2)
+        bb.fc = nn.Identity()
+        bb = bb.to(dev)
+        for nm, p in bb.named_parameters():
+            p.requires_grad = nm.startswith("layer4")
+        print(f"resnet50: unfreeze layer4 -> {sum(p.requires_grad for p in bb.parameters())} "
+              f"trainable param-tensors", flush=True)
+        dim = 2048
+    else:
+        bb = unfreeze_last(AutoModel.from_pretrained(DINO).to(dev), args.unfreeze)
+        dim = bb.config.hidden_size
+    projector = mlp(dim, 1024, 256).to(dev)
     params = [p for p in bb.parameters() if p.requires_grad] + list(projector.parameters())
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-4)
 
+    def feat(x):
+        return bb(x) if args.arch == "resnet50" else bb(pixel_values=x).last_hidden_state[:, 0]
+
     def z(x):
-        return projector(bb(pixel_values=x).last_hidden_state[:, 0])
+        return projector(feat(x))
 
     for ep in range(args.epochs):
-        bb.train(); projector.train()
+        if args.arch == "resnet50":
+            bb.eval(); bb.layer4.train()      # keep BN stats frozen outside the trained block
+        else:
+            bb.train()
+        projector.train()
         tot = tacc = 0.0
         for nb, b in enumerate(dl):
             b = {k: v.to(dev, non_blocking=True) for k, v in b.items()}
@@ -274,7 +300,7 @@ def main():
         print(f"epoch {ep+1:>2}/{args.epochs}  loss={tot/len(dl):.4f}  pos-acc={tacc/len(dl):.3f}", flush=True)
         if (ep + 1) % args.save_every == 0 or (ep + 1) == args.epochs:
             p = args.out.replace(".pt", f"_e{ep+1}.pt")
-            torch.save({"backbone": bb.state_dict()}, p)
+            torch.save({"backbone": bb.state_dict(), "arch": args.arch}, p)
             print(f"  saved -> {p}", flush=True)
 
 
